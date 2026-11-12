@@ -1,10 +1,10 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
 	"mime"
 	"net/http"
 	"net/url"
@@ -13,8 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/safeurl"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"golang.org/x/sync/errgroup"
 )
+
+type errNetwork struct{ error }
 
 type AssetForUpload struct {
 	Name  string
@@ -24,10 +30,21 @@ type AssetForUpload struct {
 	MIMEType string
 	Open     func() (io.ReadCloser, error)
 
-	ExistingURL string
+	ExistingURL safeurl.SafeURL
 }
 
 func AssetsFromArgs(args []string) (assets []*AssetForUpload, err error) {
+	labeledArgs, unlabeledArgs := cmdutil.Partition(args, func(arg string) bool {
+		return strings.Contains(arg, "#")
+	})
+
+	args, err = cmdutil.GlobPaths(unlabeledArgs)
+	if err != nil {
+		return nil, err
+	}
+
+	args = append(args, labeledArgs...)
+
 	for _, arg := range args {
 		var label string
 		fn := arg
@@ -91,65 +108,54 @@ func fileExt(fn string) string {
 	return path.Ext(fn)
 }
 
-func ConcurrentUpload(httpClient *http.Client, uploadURL string, numWorkers int, assets []*AssetForUpload) error {
+func ConcurrentUpload(httpClient *http.Client, hostname string, uploadURL safeurl.SafeURL, numWorkers int, assets []*AssetForUpload) error {
 	if numWorkers == 0 {
 		return errors.New("the number of concurrent workers needs to be greater than 0")
 	}
 
-	jobs := make(chan AssetForUpload, len(assets))
-	results := make(chan error, len(assets))
-
-	if len(assets) < numWorkers {
-		numWorkers = len(assets)
-	}
-
-	for w := 1; w <= numWorkers; w++ {
-		go func() {
-			for a := range jobs {
-				results <- uploadWithDelete(httpClient, uploadURL, a)
-			}
-		}()
-	}
+	ctx := context.Background()
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(numWorkers)
 
 	for _, a := range assets {
-		jobs <- *a
+		asset := *a
+		g.Go(func() error {
+			return uploadWithDelete(gctx, httpClient, hostname, uploadURL, asset)
+		})
 	}
-	close(jobs)
 
-	var uploadError error
-	for i := 0; i < len(assets); i++ {
-		if err := <-results; err != nil {
-			uploadError = err
-		}
-	}
-	return uploadError
+	return g.Wait()
 }
 
-const maxRetries = 3
+func shouldRetry(err error) bool {
+	if _, ok := errors.AsType[errNetwork](err); ok {
+		return true
+	}
+	var httpError api.HTTPError
+	return errors.As(err, &httpError) && httpError.StatusCode >= 500
+}
 
-func uploadWithDelete(httpClient *http.Client, uploadURL string, a AssetForUpload) error {
-	if a.ExistingURL != "" {
-		err := deleteAsset(httpClient, a.ExistingURL)
-		if err != nil {
+// Allow injecting backoff interval in tests.
+var retryInterval = time.Millisecond * 200
+
+func uploadWithDelete(ctx context.Context, httpClient *http.Client, hostname string, uploadURL safeurl.SafeURL, a AssetForUpload) error {
+	if a.ExistingURL != nil && a.ExistingURL.String() != "" {
+		if err := deleteAsset(ctx, httpClient, hostname, a.ExistingURL); err != nil {
 			return err
 		}
 	}
-
-	retries := 0
-	for {
-		var httpError api.HTTPError
-		_, err := uploadAsset(httpClient, uploadURL, a)
-		// retry upload several times upon receiving HTTP 5xx
-		if err == nil || !errors.As(err, &httpError) || httpError.StatusCode < 500 || retries < maxRetries {
+	bo := backoff.NewConstantBackOff(retryInterval)
+	return backoff.Retry(func() error {
+		_, err := uploadAsset(ctx, httpClient, uploadURL, a)
+		if err == nil || shouldRetry(err) {
 			return err
 		}
-		retries++
-		time.Sleep(time.Duration(retries) * time.Second)
-	}
+		return backoff.Permanent(err)
+	}, backoff.WithContext(backoff.WithMaxRetries(bo, 3), ctx))
 }
 
-func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload) (*ReleaseAsset, error) {
-	u, err := url.Parse(uploadURL)
+func uploadAsset(ctx context.Context, httpClient *http.Client, uploadURL safeurl.SafeURL, asset AssetForUpload) (*ReleaseAsset, error) {
+	u, err := url.Parse(uploadURL.String())
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +164,16 @@ func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload
 	params.Set("label", asset.Label)
 	u.RawQuery = params.Encode()
 
+	// Since u is derived from uploadURL, an already-trusted safeurl.SafeURL, the resulting URL is safe to declare as such.
+	safeURL := safeurl.NewImmutableSafeURL(u.String())
+
 	f, err := asset.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	req, err := http.NewRequest("POST", u.String(), f)
+	req, err := http.NewRequestWithContext(ctx, "POST", safeURL.String(), f)
 	if err != nil {
 		return nil, err
 	}
@@ -172,47 +181,42 @@ func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload
 	req.Header.Set("Content-Type", asset.MIMEType)
 	req.GetBody = asset.Open
 
-	resp, err := httpClient.Do(req)
+	// DoRequest rather than Request because ContentLength and GetBody are set on the request
+	// itself, and neither can be expressed as a header. The upload URL is supplied by the API
+	// and points at the uploads host, so there is no endpoint resolution to delegate here.
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	resp, err := api.NewClientFromHTTP(httpClient).DoRequest(req)
 	if err != nil {
-		return nil, err
+		// Only transport failures are retryable as network errors. A response that arrived and
+		// carried a failing status is reported as is, so shouldRetry can judge it by status.
+		if _, ok := errors.AsType[api.HTTPError](err); ok {
+			return nil, err
+		}
+		return nil, errNetwork{err}
 	}
 	defer resp.Body.Close()
 
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
-	if !success {
-		return nil, api.HandleHTTPError(resp)
-	}
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	var newAsset ReleaseAsset
-	err = json.Unmarshal(b, &newAsset)
-	if err != nil {
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&newAsset); err != nil {
 		return nil, err
 	}
 
 	return &newAsset, nil
 }
 
-func deleteAsset(httpClient *http.Client, assetURL string) error {
-	req, err := http.NewRequest("DELETE", assetURL, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := httpClient.Do(req)
+func deleteAsset(ctx context.Context, httpClient *http.Client, hostname string, assetURL safeurl.SafeURL) error {
+	// The asset URL is supplied by the API, so it is absolute and requested as given.
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	resp, err := api.NewClientFromHTTP(httpClient).RequestWithContext(ctx, hostname, http.MethodDelete, assetURL.String(), nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
-	if !success {
-		return api.HandleHTTPError(resp)
-	}
 
 	return nil
 }

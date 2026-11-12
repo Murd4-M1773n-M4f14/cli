@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"github.com/cli/cli/v2/git"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -8,14 +9,14 @@ type mockGitClient struct {
 	mock.Mock
 }
 
-func (g *mockGitClient) BranchRemote(a string) (string, error) {
-	args := g.Called(a)
-	return args.String(0), args.Error(1)
-}
-
 func (g *mockGitClient) UpdateBranch(b, r string) error {
 	args := g.Called(b, r)
 	return args.Error(0)
+}
+
+func (g *mockGitClient) Worktrees() ([]git.Worktree, error) {
+	args := g.Called()
+	return args.Get(0).([]git.Worktree), args.Error(1)
 }
 
 func (g *mockGitClient) CreateBranch(b, r, u string) error {

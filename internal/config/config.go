@@ -1,0 +1,1001 @@
+package config
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/keyring"
+	o "github.com/cli/cli/v2/pkg/option"
+	ghauth "github.com/cli/go-gh/v2/pkg/auth"
+	ghConfig "github.com/cli/go-gh/v2/pkg/config"
+)
+
+// Important: some of the following configuration settings are used outside of `cli/cli`,
+// they are defined here to avoid `cli/cli` being changed unexpectedly.
+const (
+	accessibleColorsKey    = "accessible_colors" // used by cli/go-gh to enable the use of customizable, accessible 4-bit colors.
+	accessiblePrompterKey  = "accessible_prompter"
+	aliasesKey             = "aliases"
+	browserKey             = "browser" // used by cli/go-gh to open URLs in web browsers
+	clipboardKey           = "clipboard"
+	colorLabelsKey         = "color_labels"
+	apiHostKey             = "api_host" // used by cli/go-gh to redirect API requests for a host
+	editorKey              = "editor"   // used by cli/go-gh to open interactive text editor
+	gitProtocolKey         = "git_protocol"
+	hostsKey               = "hosts" // used by cli/go-gh to locate authenticated host tokens
+	httpUnixSocketKey      = "http_unix_socket"
+	oauthTokenKey          = "oauth_token" // used by cli/go-gh to locate authenticated host tokens
+	pagerKey               = "pager"
+	promptKey              = "prompt"
+	preferEditorPromptKey  = "prefer_editor_prompt"
+	expiringCredentialsKey = "expiring_credentials"
+	spinnerKey             = "spinner"
+	telemetryKey           = "telemetry"
+	userKey                = "user"
+	usersKey               = "users"
+	versionKey             = "version"
+)
+
+func NewConfig() (gh.Config, error) {
+	c, err := ghConfig.Read(fallbackConfig())
+	if err != nil {
+		return nil, err
+	}
+	config := &cfg{cfg: c}
+	config.auth = &AuthConfig{cfg: c}
+	return config, nil
+}
+
+// Implements Config interface
+type cfg struct {
+	cfg  *ghConfig.Config
+	auth *AuthConfig
+}
+
+func (c *cfg) get(hostname, key string) o.Option[string] {
+	if hostname != "" {
+		val, err := c.cfg.Get([]string{hostsKey, hostname, key})
+		if err == nil {
+			return o.Some(val)
+		}
+	}
+
+	val, err := c.cfg.Get([]string{key})
+	if err == nil {
+		return o.Some(val)
+	}
+
+	return o.None[string]()
+}
+
+func (c *cfg) GetOrDefault(hostname, key string) o.Option[gh.ConfigEntry] {
+	if val := c.get(hostname, key); val.IsSome() {
+		// Map the Option[string] to Option[gh.ConfigEntry] with a source of ConfigUserProvided
+		return o.Map(val, toConfigEntry(gh.ConfigUserProvided))
+	}
+
+	if defaultVal := defaultFor(key); defaultVal.IsSome() {
+		// Map the Option[string] to Option[gh.ConfigEntry] with a source of ConfigDefaultProvided
+		return o.Map(defaultVal, toConfigEntry(gh.ConfigDefaultProvided))
+	}
+
+	return o.None[gh.ConfigEntry]()
+}
+
+// toConfigEntry is a helper function to convert a string value to a ConfigEntry with a given source.
+//
+// It's a bit of FP style but it allows us to map an Option[string] to Option[gh.ConfigEntry] without
+// unwrapping the it and rewrapping it.
+func toConfigEntry(source gh.ConfigSource) func(val string) gh.ConfigEntry {
+	return func(val string) gh.ConfigEntry {
+		return gh.ConfigEntry{Value: val, Source: source}
+	}
+}
+
+func (c *cfg) Set(hostname, key, value string) {
+	if hostname == "" {
+		c.cfg.Set([]string{key}, value)
+		return
+	}
+
+	c.cfg.Set([]string{hostsKey, hostname, key}, value)
+
+	if user, _ := c.cfg.Get([]string{hostsKey, hostname, userKey}); user != "" {
+		c.cfg.Set([]string{hostsKey, hostname, usersKey, user, key}, value)
+	}
+}
+
+func (c *cfg) Write() error {
+	return ghConfig.Write(c.cfg)
+}
+
+func (c *cfg) Aliases() gh.AliasConfig {
+	return &AliasConfig{cfg: c.cfg}
+}
+
+// Authentication returns the single AuthConfig instance associated with this config. A single instance is returned so
+// that dependencies supplied after construction, such as the token refresher, remain visible to every caller. All of
+// its read methods are safe to share, and the few write methods are only used within the auth command set.
+func (c *cfg) Authentication() gh.AuthConfig {
+	if c.auth == nil {
+		c.auth = &AuthConfig{cfg: c.cfg}
+	}
+	return c.auth
+}
+
+func (c *cfg) AccessibleColors(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, accessibleColorsKey).Unwrap()
+}
+
+func (c *cfg) AccessiblePrompter(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, accessiblePrompterKey).Unwrap()
+}
+
+func (c *cfg) Browser(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, browserKey).Unwrap()
+}
+
+func (c *cfg) Clipboard() gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault("", clipboardKey).Unwrap()
+}
+
+func (c *cfg) ColorLabels(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, colorLabelsKey).Unwrap()
+}
+
+func (c *cfg) Editor(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, editorKey).Unwrap()
+}
+
+func (c *cfg) GitProtocol(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, gitProtocolKey).Unwrap()
+}
+
+func (c *cfg) HTTPUnixSocket(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, httpUnixSocketKey).Unwrap()
+}
+
+func (c *cfg) Pager(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, pagerKey).Unwrap()
+}
+
+func (c *cfg) Prompt(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, promptKey).Unwrap()
+}
+
+func (c *cfg) PreferEditorPrompt(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, preferEditorPromptKey).Unwrap()
+}
+
+func (c *cfg) ExpiringCredentials(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, expiringCredentialsKey).Unwrap()
+}
+
+func (c *cfg) Spinner(hostname string) gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault(hostname, spinnerKey).Unwrap()
+}
+
+func (c *cfg) Telemetry() gh.ConfigEntry {
+	// Intentionally panic if there is no user provided value or default value (which would be a programmer error)
+	return c.GetOrDefault("", telemetryKey).Unwrap()
+}
+
+func (c *cfg) Version() o.Option[string] {
+	return c.get("", versionKey)
+}
+
+func (c *cfg) Migrate(m gh.Migration) error {
+	// If there is no version entry we must never have applied a migration, and the following conditional logic
+	// handles the version as an empty string correctly.
+	version := c.Version().UnwrapOrZero()
+
+	// If migration has already occurred then do not attempt to migrate again.
+	if m.PostVersion() == version {
+		return nil
+	}
+
+	// If migration is incompatible with current version then return an error.
+	if m.PreVersion() != version {
+		return fmt.Errorf("failed to migrate as %q pre migration version did not match config version %q", m.PreVersion(), version)
+	}
+
+	if err := m.Do(c.cfg); err != nil {
+		return fmt.Errorf("failed to migrate config: %s", err)
+	}
+
+	c.Set("", versionKey, m.PostVersion())
+
+	// Then write out our migrated config.
+	if err := c.Write(); err != nil {
+		return fmt.Errorf("failed to write config after migration: %s", err)
+	}
+
+	return nil
+}
+
+func (c *cfg) CacheDir() string {
+	return ghConfig.CacheDir()
+}
+
+func defaultFor(key string) o.Option[string] {
+	for _, co := range Options {
+		if co.Key == key {
+			return o.Some(co.DefaultValue)
+		}
+	}
+	return o.None[string]()
+}
+
+// AuthConfig is used for interacting with some persistent configuration for gh,
+// with knowledge on how to access encrypted storage when neccesarry.
+// Behavior is scoped to authentication specific tasks.
+type AuthConfig struct {
+	cfg                 *ghConfig.Config
+	refresher           gh.TokenRefresher
+	defaultHostOverride func() (string, string)
+	hostsOverride       func() []string
+	tokenOverride       func(string) (string, string)
+	// acquireRefreshLock acquires the cross-process refresh lock and returns a function that releases it. It is nil in
+	// production, where withFreshConfigForRefresh falls back to a flock-backed implementation. Tests set it to a no-op
+	// so they never take a real filesystem lock.
+	acquireRefreshLock func(ctx context.Context, path string) (unlock func(), err error)
+	// reloadConfig re-reads the config from disk into the shared config. It is nil in production, where
+	// withFreshConfigForRefresh falls back to ghConfig.Reload. Tests set it to a no-op because their config is parsed
+	// from a string and a reload would discard it by reading the empty temp config dir.
+	reloadConfig func() error
+	// refreshMu serializes withFreshConfigForRefresh within this process. The cross-process flock guards against other
+	// gh processes but not against goroutines sharing this single AuthConfig instance, so this mutex provides the
+	// in-process half of the mutual exclusion that keeps a rotating refresh token from being spent twice.
+	refreshMu sync.Mutex
+	// warningsMu guards warnings.
+	warningsMu sync.Mutex
+	// warnings collects deduplicated messages, such as a skipped token refresh, for the user to see before gh exits.
+	warnings []string
+}
+
+// Warnings returns the deduplicated warnings recorded so far in this process, such as a skipped token refresh, in the
+// order they were first recorded. Callers are expected to show them to the user before gh exits.
+func (c *AuthConfig) Warnings() []string {
+	c.warningsMu.Lock()
+	defer c.warningsMu.Unlock()
+	return slices.Clone(c.warnings)
+}
+
+// addWarning records msg for Warnings unless an identical message was already recorded.
+func (c *AuthConfig) addWarning(msg string) {
+	c.warningsMu.Lock()
+	defer c.warningsMu.Unlock()
+	if !slices.Contains(c.warnings, msg) {
+		c.warnings = append(c.warnings, msg)
+	}
+}
+
+// SetTokenRefresher supplies the refresher used to renew tokens. Because Authentication returns a single shared
+// AuthConfig, a refresher set once remains available to every later caller.
+func (c *AuthConfig) SetTokenRefresher(refresher gh.TokenRefresher) {
+	c.refresher = refresher
+}
+
+// ActiveTokenType reports what kind of credential the active token is, so a
+// caller that only needs to know that can avoid handling the token. It is
+// currently unused.
+func (c *AuthConfig) ActiveTokenType(hostname string) gh.TokenType {
+	token := c.ActiveToken(hostname).Token
+	for _, tokenType := range gh.TokenTypes {
+		if strings.HasPrefix(token, string(tokenType)) {
+			return tokenType
+		}
+	}
+	return gh.TokenTypeUnknown
+}
+
+// ActiveToken retrieves the active credential for the given hostname, searching environment variables, plain text
+// config, and lastly encrypted storage. It returns the last stored token as-is, including the current access token of
+// a refreshable credential, and never contacts the token endpoint to refresh it. Callers that need a token valid for
+// API calls should use ActiveTokenWithRefresh.
+func (c *AuthConfig) ActiveToken(hostname string) gh.Credential {
+	if c.tokenOverride != nil {
+		token, source := c.tokenOverride(hostname)
+		return gh.Credential{Source: source, Token: token}
+	}
+
+	token, source := ghauth.TokenFromEnvOrConfig(hostname)
+	if token != "" {
+		return gh.Credential{Source: source, Token: token}
+	}
+
+	// Intentional behavior change from older gh: the active-user lookup goes through TokenForUser, which also consults
+	// the per-user config oauth_token and the refreshable slot, rather than only the per-user keyring slot. This is
+	// groundwork for refreshable credentials and is the more correct result. The only observable difference is when a
+	// user has a per-user config oauth_token (or refreshable record) but no per-user keyring slot while an unkeyed
+	// keyring token also exists: older gh returned the unkeyed keyring token, whereas we now return the per-user
+	// credential. That state is rare because activateUser mirrors a per-user insecure token into the host-level
+	// oauth_token, which TokenFromEnvOrConfig resolves above before we reach here. This is accepted and pinned by
+	// TestActiveTokenPrefersPerUserConfigTokenOverUnkeyedKeyring.
+	if user, err := c.ActiveUser(hostname); err == nil {
+		if credential, err := c.TokenForUser(hostname, user); err == nil {
+			return credential
+		}
+	}
+
+	// We should generally be able to find a token for the active user, but in some cases such as if the keyring was
+	// set up in a very old version of the CLI, it may only have an unkeyed token, so fall back to it.
+	if token, err := c.TokenFromKeyring(hostname); err == nil {
+		return gh.Credential{Source: gh.TokenSourceKeyring, Token: token}
+	}
+
+	return gh.Credential{Source: source, Token: token}
+}
+
+// ActiveTokenWithRefresh retrieves the active credential for the given hostname and, when it is refreshable and its
+// access token is expiring, renews and persists it, returning the credential to use and the refresh outcome.
+// Non-refreshable credentials are returned unchanged with RefreshStatusInapplicable.
+func (c *AuthConfig) ActiveTokenWithRefresh(hostname string) (gh.Credential, gh.RefreshStatus, error) {
+	credential := c.ActiveToken(hostname)
+	if !credential.IsRefreshable() {
+		return credential, gh.RefreshStatusInapplicable, nil
+	}
+	user, err := c.ActiveUser(hostname)
+	if err != nil {
+		// A refreshable active credential is always keyed by the active user, so this is unreachable in practice.
+		// If we somehow cannot identify the user, we have no key to refresh under, so return the credential as-is.
+		return credential, gh.RefreshStatusInapplicable, err
+	}
+	return c.refreshCredentialForUser(hostname, user, credential)
+}
+
+// HasActiveToken returns true when a token for the hostname is present.
+func (c *AuthConfig) HasActiveToken(hostname string) bool {
+	return c.ActiveToken(hostname).Token != ""
+}
+
+// HasEnvToken returns true when a token has been specified in an
+// environment variable, else returns false.
+func (c *AuthConfig) HasEnvToken() bool {
+	// This will check if there are any environment variable
+	// authentication tokens set for enterprise hosts.
+	// Any non-github.com hostname is fine here
+	hostname := "example.com"
+	if c.tokenOverride != nil {
+		token, _ := c.tokenOverride(hostname)
+		if token != "" {
+			return true
+		}
+	}
+	// TODO: This is _extremely_ knowledgeable about the implementation of TokenFromEnvOrConfig
+	// It has to use a hostname that is not going to be found in the hosts so that it
+	// can guarantee that tokens will only be returned from a set env var.
+	// Discussed here, but maybe worth revisiting: https://github.com/cli/cli/pull/7169#discussion_r1136979033
+	token, _ := ghauth.TokenFromEnvOrConfig(hostname)
+	return token != ""
+}
+
+// SetActiveToken will override any token resolution and return the given
+// token and source for all calls to ActiveToken. Use for testing purposes only.
+func (c *AuthConfig) SetActiveToken(token, source string) {
+	c.tokenOverride = func(_ string) (string, string) {
+		return token, source
+	}
+}
+
+// TokenFromKeyring will retrieve the auth token for the given hostname,
+// only searching in encrypted storage.
+func (c *AuthConfig) TokenFromKeyring(hostname string) (string, error) {
+	return keyring.Get(keyringServiceName(hostname), "")
+}
+
+// TokenFromKeyringForUser will retrieve the auth token for the given hostname
+// and username, only searching in encrypted storage.
+//
+// An empty username will return an error because the potential to return
+// the currently active token under surprising cases is just too high to risk
+// compared to the utility of having the function being smart.
+func (c *AuthConfig) TokenFromKeyringForUser(hostname, username string) (string, error) {
+	if username == "" {
+		return "", errors.New("username cannot be blank")
+	}
+
+	return keyring.Get(keyringServiceName(hostname), username)
+}
+
+// ActiveUser will retrieve the username for the active user at the given hostname.
+// This will not be accurate if the oauth token is set from an environment variable.
+func (c *AuthConfig) ActiveUser(hostname string) (string, error) {
+	return c.cfg.Get([]string{hostsKey, hostname, userKey})
+}
+
+func (c *AuthConfig) Hosts() []string {
+	if c.hostsOverride != nil {
+		return c.hostsOverride()
+	}
+	return ghauth.KnownHosts()
+}
+
+// APIHostForHost returns the api_host configured for host, reporting false when
+// the host has no api_host set. It is the inverse of HostForAPIHost.
+func (c *AuthConfig) APIHostForHost(host string) (string, bool) {
+	if host == "" || c.cfg == nil {
+		return "", false
+	}
+	configured, err := c.cfg.Get([]string{hostsKey, host, apiHostKey})
+	if err != nil || configured == "" {
+		return "", false
+	}
+	return configured, true
+}
+
+// HostForAPIHost returns the configured host whose api_host points at apiHost,
+// reporting false when no host claims it.
+//
+// go-gh sends API requests for a host to that host's api_host, which is a
+// hostname gh is not otherwise logged in to. Callers that resolve credentials
+// from a request URL need this to get back to the host the request is really
+// for. It answers only the mapping question; deciding whether a given lookup
+// should honour api_host at all is the caller's business, since api_host covers
+// API traffic and not, say, git operations.
+//
+// A misconfiguration where several hosts share one api_host resolves to the
+// first match in lexical Hosts order.
+func (c *AuthConfig) HostForAPIHost(apiHost string) (string, bool) {
+	if apiHost == "" {
+		return "", false
+	}
+	hosts := slices.Clone(c.Hosts())
+	slices.Sort(hosts)
+	for _, host := range hosts {
+		configured, err := c.cfg.Get([]string{hostsKey, host, apiHostKey})
+		if err != nil || configured == "" {
+			continue
+		}
+		if strings.EqualFold(configured, apiHost) {
+			return host, true
+		}
+	}
+	return "", false
+}
+
+// SetHosts will override any hosts resolution and return the given
+// hosts for all calls to Hosts. Use for testing purposes only.
+func (c *AuthConfig) SetHosts(hosts []string) {
+	c.hostsOverride = func() []string {
+		return hosts
+	}
+}
+
+func (c *AuthConfig) DefaultHost() (string, string) {
+	if c.defaultHostOverride != nil {
+		return c.defaultHostOverride()
+	}
+	return ghauth.DefaultHost()
+}
+
+// SetDefaultHost will override any host resolution and return the given
+// host and source for all calls to DefaultHost. Use for testing purposes only.
+func (c *AuthConfig) SetDefaultHost(host, source string) {
+	c.defaultHostOverride = func() (string, string) {
+		return host, source
+	}
+}
+
+// Login will set user, git protocol, and auth token for the given hostname.
+// If the encrypt option is specified it will first try to store the auth token
+// in encrypted storage and will fall back to the plain text config file.
+func (c *AuthConfig) Login(hostname, username, token, gitProtocol string, secureStorage bool) (bool, error) {
+	// Run under the shared refresh lock, like LoginRefreshable and Logout, so login serializes against an in-flight
+	// refresh and wins either ordering: a refresh that persists first is superseded by the credential stored here, and
+	// a refresh still waiting on the lock reloads afterwards, finds the refreshable record removed below, and bails
+	// without persisting. The lock is best effort, so login still proceeds when it is unavailable.
+	var insecureStorageUsed bool
+	err := c.withFreshConfigForRefresh(func(lockErr error) error {
+		var err error
+		insecureStorageUsed, err = c.login(hostname, username, token, gitProtocol, secureStorage)
+		return err
+	})
+	return insecureStorageUsed, err
+}
+
+func (c *AuthConfig) login(hostname, username, token, gitProtocol string, secureStorage bool) (bool, error) {
+	// In this section we set up the users config
+	var setErr error
+	if secureStorage {
+		// Try to set the token for this user in the encrypted storage for later switching
+		setErr = keyring.Set(keyringServiceName(hostname), username, token)
+		if setErr == nil {
+			// Clean up the previous oauth_token from the config file, if there were one
+			_ = c.cfg.Remove([]string{hostsKey, hostname, usersKey, username, oauthTokenKey})
+		}
+	}
+	insecureStorageUsed := false
+	if !secureStorage || setErr != nil {
+		// And set the oauth token under the user for later switching
+		c.cfg.Set([]string{hostsKey, hostname, usersKey, username, oauthTokenKey}, token)
+		insecureStorageUsed = true
+	}
+
+	// Remove any refreshable credential for this user so the non-refreshable and refreshable forms never coexist. This
+	// mirrors loginRefreshable, which removes the non-expiring credential when storing a refreshable one. Without it,
+	// setActiveCredential keeps resolving the stale refreshable record as active and never copies the new
+	// non-refreshable token into the host-level slot, which also leaves go-gh extensions unable to read a token.
+	if err := c.purgeRefreshableForLogin(hostname, username); err != nil {
+		return insecureStorageUsed, err
+	}
+
+	return insecureStorageUsed, c.completeLogin(hostname, username, gitProtocol)
+}
+
+// completeLogin sets the host git protocol, ensures the user entry is persisted, and activates the user. It is shared
+// by Login and LoginRefreshable once the credential has been stored.
+func (c *AuthConfig) completeLogin(hostname, username, gitProtocol string) error {
+	if gitProtocol != "" {
+		// Set the host level git protocol
+		// Although it might be expected that this is handled by switch, git protocol
+		// is currently a host level config and not a user level config, so any change
+		// will overwrite the protocol for all users on the host.
+		c.cfg.Set([]string{hostsKey, hostname, gitProtocolKey}, gitProtocol)
+	}
+
+	// Create the username key with an empty value so it will be
+	// written even when there are no keys set under it.
+	if _, getErr := c.cfg.Get([]string{hostsKey, hostname, usersKey, username}); getErr != nil {
+		c.cfg.Set([]string{hostsKey, hostname, usersKey, username}, "")
+	}
+
+	// Then we activate the new user
+	return c.activateUser(hostname, username)
+}
+
+func (c *AuthConfig) SwitchUser(hostname, user string) error {
+	previouslyActiveUser, err := c.ActiveUser(hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get active user: %s", err)
+	}
+
+	previousSource := c.ActiveToken(hostname).Source
+	if previousSource != gh.TokenSourceKeyring &&
+		previousSource != gh.TokenSourceOAuthToken &&
+		previousSource != gh.TokenSourceRefreshableOAuthToken {
+		return fmt.Errorf("currently active token for %s is from %s", hostname, previousSource)
+	}
+
+	err = c.activateUser(hostname, user)
+	if err != nil {
+		// activateUser writes the config file only as its final step, so any failure means the on-disk config is
+		// still in its previous clean state and no disk write is needed to undo it. What may have changed is the
+		// in-memory config and the keyring: the keyring is persistent, so a stray active token from the failed
+		// switch is real, while the in-memory config only needs repairing so a later write persists the old data.
+		// setActiveCredential handles both, clearing every active representation and reinstalling the previously
+		// active user's credential.
+		if _, restoreErr := c.setActiveCredential(hostname, previouslyActiveUser); restoreErr != nil {
+			err = errors.Join(err, restoreErr)
+		}
+		c.cfg.Set([]string{hostsKey, hostname, userKey}, previouslyActiveUser)
+
+		return err
+	}
+
+	return nil
+}
+
+// Logout will remove user, git protocol, and auth token for the given hostname.
+// It will remove the auth token from the encrypted storage if it exists there.
+func (c *AuthConfig) Logout(hostname, username string) error {
+	// Run under the shared refresh lock so logout wins any race with an in-flight refresh: a concurrent refresh
+	// cannot persist a rotated credential after logout has removed the account and reported success.
+	return c.withFreshConfigForRefresh(func(lockErr error) error {
+		users := c.UsersForHost(hostname)
+
+		// The user's per-user keyring records are not covered by removing config keys, so delete them explicitly.
+		// Historically the per-user token was only removed in the single-user branch, leaking it when logging out of a
+		// multi-user host.
+		_ = keyring.Delete(refreshableServiceName(hostname), username)
+		_ = keyring.Delete(keyringServiceName(hostname), username)
+
+		// If there is only one (or zero) users, then we remove the host
+		// and unset the keyring tokens.
+		if len(users) < 2 {
+			_ = c.cfg.Remove([]string{hostsKey, hostname})
+			_ = keyring.Delete(keyringServiceName(hostname), "")
+			return ghConfig.Write(c.cfg)
+		}
+
+		// Otherwise, we remove the user from this host
+		_ = c.cfg.Remove([]string{hostsKey, hostname, usersKey, username})
+
+		// This error is ignorable because we already know there is an active user for the host
+		activeUser, _ := c.ActiveUser(hostname)
+
+		// If the user we're removing isn't active, then we just write the config
+		if activeUser != username {
+			return ghConfig.Write(c.cfg)
+		}
+
+		// Otherwise we get the first user in the slice that isn't the user we're removing
+		switchUserIdx := slices.IndexFunc(users, func(n string) bool {
+			return n != username
+		})
+
+		// And activate them
+		return c.activateUser(hostname, users[switchUserIdx])
+	})
+}
+
+func (c *AuthConfig) activateUser(hostname, user string) error {
+	found, err := c.setActiveCredential(hostname, user)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("no token found for %s", user)
+	}
+
+	// Then we'll update the active user for the host
+	c.cfg.Set([]string{hostsKey, hostname, userKey}, user)
+
+	return ghConfig.Write(c.cfg)
+}
+
+// setActiveCredential clears every host level active credential representation and copies the user's stored
+// credential into the active slot, preserving its storage form. It neither sets the active user nor writes the
+// config, so it can also be used to restore state after a failed switch. It reports whether a credential was found
+// for the user.
+func (c *AuthConfig) setActiveCredential(hostname, user string) (bool, error) {
+	// Idempotently clear the non-expiring active representations so that no stale token can outrank the credential we
+	// are about to activate. Refreshable credentials have no host-level active copy, so there is nothing to clear for
+	// them; they are resolved per-user through the active user key.
+	_ = keyring.Delete(keyringServiceName(hostname), "")
+	_ = c.cfg.Remove([]string{hostsKey, hostname, oauthTokenKey})
+
+	// The non-expiring keyring token is checked first so the common non-refreshable user does not pay an extra
+	// refreshable-slot keyring miss on every lookup. On a hit, copy it into the host active slot. This keyring-first
+	// order is kept identical to TokenForUser so activation and resolution never disagree about which credential is
+	// current, even in the mixed state that write paths keep unreachable.
+	if token, err := keyring.Get(keyringServiceName(hostname), user); err == nil {
+		if err = keyring.Set(keyringServiceName(hostname), "", token); err != nil {
+			return false, fmt.Errorf("failed to move active token in keyring: %v", err)
+		}
+		return true, nil
+	}
+
+	// Then the managed refreshable credential. It lives only in the per-user slot and is surfaced as active through the
+	// active user key, so confirming it exists is all that activation needs.
+	if _, _, err := c.refreshableForUser(hostname, user); err == nil {
+		return true, nil
+	} else if !errors.Is(err, errRefreshableNotFound) {
+		return false, err
+	}
+
+	// Otherwise fall back to a non-expiring credential in the insecure config.
+	if token, err := c.cfg.Get([]string{hostsKey, hostname, usersKey, user, oauthTokenKey}); err == nil {
+		c.cfg.Set([]string{hostsKey, hostname, oauthTokenKey}, token)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (c *AuthConfig) UsersForHost(hostname string) []string {
+	users, err := c.cfg.Keys([]string{hostsKey, hostname, usersKey})
+	if err != nil {
+		return nil
+	}
+
+	return users
+}
+
+// TokenForUser retrieves the credential for the given user and hostname. Like ActiveToken it returns the last stored
+// token as-is, including the current access token of a refreshable credential, and never refreshes it; use
+// TokenForUserWithRefresh when the token must be valid for API calls.
+//
+// It checks the non-refreshable keyring token first, then the managed refreshable credential, then the non-refreshable
+// config token. The ordinary keyring is probed first so the common non-refreshable user pays a single keyring lookup
+// rather than an extra miss on the refreshable slot on every request. This order is kept identical to
+// setActiveCredential so activation and resolution always agree on which credential is current, even in the mixed
+// state that should never occur because logging in with one kind removes the other.
+func (c *AuthConfig) TokenForUser(hostname, user string) (gh.Credential, error) {
+	if token, err := keyring.Get(keyringServiceName(hostname), user); err == nil {
+		return gh.Credential{Source: gh.TokenSourceKeyring, Token: token}, nil
+	}
+
+	if credential, _, err := c.refreshableForUser(hostname, user); err == nil {
+		return credential, nil
+	} else if !errors.Is(err, errRefreshableNotFound) {
+		return gh.Credential{}, err
+	}
+
+	if token, err := c.cfg.Get([]string{hostsKey, hostname, usersKey, user, oauthTokenKey}); err == nil {
+		return gh.Credential{Source: gh.TokenSourceOAuthToken, Token: token}, nil
+	}
+
+	return gh.Credential{Source: gh.TokenSourceDefault}, fmt.Errorf("no token found for '%s'", user)
+}
+
+// TokenForUserWithRefresh retrieves the credential for a specified user and hostname and, when it is refreshable and
+// its access token is expiring, renews and persists it, returning the credential to use and the refresh outcome.
+// Non-refreshable credentials are returned unchanged with RefreshStatusInapplicable.
+func (c *AuthConfig) TokenForUserWithRefresh(hostname, username string) (gh.Credential, gh.RefreshStatus, error) {
+	credential, err := c.TokenForUser(hostname, username)
+	if err != nil {
+		return credential, gh.RefreshStatusInapplicable, err
+	}
+	if !credential.IsRefreshable() {
+		return credential, gh.RefreshStatusInapplicable, nil
+	}
+	return c.refreshCredentialForUser(hostname, username, credential)
+}
+
+func keyringServiceName(hostname string) string {
+	return "gh:" + hostname
+}
+
+type AliasConfig struct {
+	cfg *ghConfig.Config
+}
+
+func (a *AliasConfig) Get(alias string) (string, error) {
+	return a.cfg.Get([]string{aliasesKey, alias})
+}
+
+func (a *AliasConfig) Add(alias, expansion string) {
+	a.cfg.Set([]string{aliasesKey, alias}, expansion)
+}
+
+func (a *AliasConfig) Delete(alias string) error {
+	return a.cfg.Remove([]string{aliasesKey, alias})
+}
+
+func (a *AliasConfig) All() map[string]string {
+	out := map[string]string{}
+	keys, err := a.cfg.Keys([]string{aliasesKey})
+	if err != nil {
+		return out
+	}
+	for _, key := range keys {
+		val, _ := a.cfg.Get([]string{aliasesKey, key})
+		out[key] = val
+	}
+	return out
+}
+
+func fallbackConfig() *ghConfig.Config {
+	return ghConfig.ReadFromString(defaultConfigStr)
+}
+
+// The schema version in here should match the PostVersion of whatever the
+// last migration we decided to run is. Therefore, if we run a new migration,
+// this should be bumped.
+const defaultConfigStr = `
+# The default config file, auto-generated by gh. Run 'gh environment' to learn more about
+# environment variables respected by gh and their precedence.
+
+# The current version of the config schema
+version: 1
+# What protocol to use when performing git operations. Supported values: ssh, https
+git_protocol: https
+# What editor gh should run when creating issues, pull requests, etc. If blank, will refer to environment.
+editor:
+# When to interactively prompt. This is a global config that cannot be overridden by hostname. Supported values: enabled, disabled
+prompt: enabled
+# Preference for editor-based interactive prompting. This is a global config that cannot be overridden by hostname. Supported values: enabled, disabled
+prefer_editor_prompt: disabled
+# Whether to prefer expiring credentials that gh refreshes automatically when logging in, without passing --expiring. Supported values: enabled, disabled
+expiring_credentials: disabled
+# A pager program to send command output to, e.g. "less". If blank, will refer to environment. Set the value to "cat" to disable the pager.
+pager:
+# Aliases allow you to create nicknames for gh commands
+aliases:
+  co: pr checkout
+# The path to a unix socket through which to send HTTP connections. If blank, HTTP traffic will be handled by net/http.DefaultTransport.
+http_unix_socket:
+# What web browser gh should use when opening URLs. If blank, will refer to environment.
+browser:
+# Whether to copy one-time OAuth device codes to the clipboard. Supported values: enabled, disabled
+clipboard: enabled
+# Whether to display labels using their RGB hex color codes in terminals that support truecolor. Supported values: enabled, disabled
+color_labels: disabled
+# Whether customizable, 4-bit accessible colors should be used. Supported values: enabled, disabled
+accessible_colors: disabled
+# Whether an accessible prompter should be used. Supported values: enabled, disabled
+accessible_prompter: disabled
+# Whether to use an animated spinner as a progress indicator. If disabled, a textual progress indicator is used instead. Supported values: enabled, disabled
+spinner: enabled
+`
+
+// ConfigScope controls whether a configuration option can be set globally, per host, or both.
+type ConfigScope int
+
+const (
+	// ConfigScopeGlobalOrHost allows an option to be set globally or for a specific host.
+	ConfigScopeGlobalOrHost ConfigScope = iota
+	// ConfigScopeGlobalOnly allows an option to be set only at the global level.
+	ConfigScopeGlobalOnly
+	// ConfigScopeHostOnly requires an option to be set for a specific host.
+	ConfigScopeHostOnly
+)
+
+// ConfigOption describes a supported configuration key.
+type ConfigOption struct {
+	Key           string
+	Description   string
+	DefaultValue  string
+	AllowedValues []string
+	Scope         ConfigScope
+	CurrentValue  func(c gh.Config, hostname string) string
+}
+
+var Options = []ConfigOption{
+	{
+		Key:          apiHostKey,
+		Description:  "experimental: the hostname to use when making API requests for a GitHub host. Note: this is not a security boundary and requests to the canonical host will remain authenticated",
+		DefaultValue: "",
+		Scope:        ConfigScopeHostOnly,
+		CurrentValue: func(c gh.Config, hostname string) string {
+			apiHost, _ := c.Authentication().APIHostForHost(hostname)
+			return apiHost
+		},
+	},
+	{
+		Key:           gitProtocolKey,
+		Description:   "the protocol to use for git clone and push operations",
+		DefaultValue:  "https",
+		AllowedValues: []string{"https", "ssh"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.GitProtocol(hostname).Value
+		},
+	},
+	{
+		Key:          editorKey,
+		Description:  "the text editor program to use for authoring text",
+		DefaultValue: "",
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Editor(hostname).Value
+		},
+	},
+	{
+		Key:           promptKey,
+		Description:   "toggle interactive prompting in the terminal",
+		DefaultValue:  "enabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Prompt(hostname).Value
+		},
+	},
+	{
+		Key:           preferEditorPromptKey,
+		Description:   "toggle preference for editor-based interactive prompting in the terminal",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.PreferEditorPrompt(hostname).Value
+		},
+	},
+	{
+		Key:           expiringCredentialsKey,
+		Description:   "toggle preference for expiring credentials that gh refreshes automatically when logging in",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.ExpiringCredentials(hostname).Value
+		},
+	},
+	{
+		Key:          pagerKey,
+		Description:  "the terminal pager program to send standard output to",
+		DefaultValue: "",
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Pager(hostname).Value
+		},
+	},
+	{
+		Key:          httpUnixSocketKey,
+		Description:  "the path to a Unix socket through which to make an HTTP connection",
+		DefaultValue: "",
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.HTTPUnixSocket(hostname).Value
+		},
+	},
+	{
+		Key:          browserKey,
+		Description:  "the web browser to use for opening URLs",
+		DefaultValue: "",
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Browser(hostname).Value
+		},
+	},
+	{
+		Key:           clipboardKey,
+		Description:   "whether to copy one-time OAuth device codes to the clipboard",
+		DefaultValue:  "enabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		Scope:         ConfigScopeGlobalOnly,
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Clipboard().Value
+		},
+	},
+	{
+		Key:           colorLabelsKey,
+		Description:   "whether to display labels using their RGB hex color codes in terminals that support truecolor",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.ColorLabels(hostname).Value
+		},
+	},
+	{
+		Key:           accessibleColorsKey,
+		Description:   "whether customizable, 4-bit accessible colors should be used",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.AccessibleColors(hostname).Value
+		},
+	},
+	{
+		Key:           accessiblePrompterKey,
+		Description:   "whether an accessible prompter should be used",
+		DefaultValue:  "disabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.AccessiblePrompter(hostname).Value
+		},
+	},
+	{
+		Key:           spinnerKey,
+		Description:   "whether to use an animated spinner as a progress indicator",
+		DefaultValue:  "enabled",
+		AllowedValues: []string{"enabled", "disabled"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Spinner(hostname).Value
+		},
+	},
+	{
+		Key:           telemetryKey,
+		Description:   "whether telemetry is enabled, disabled, or logging",
+		DefaultValue:  "enabled",
+		AllowedValues: []string{"enabled", "disabled", "log"},
+		CurrentValue: func(c gh.Config, hostname string) string {
+			return c.Telemetry().Value
+		},
+	},
+}
+
+func HomeDirPath(subdir string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	newPath := filepath.Join(homeDir, subdir)
+	return newPath, nil
+}
+
+func StateDir() string {
+	return ghConfig.StateDir()
+}
+
+func DataDir() string {
+	return ghConfig.DataDir()
+}
+
+func ConfigDir() string {
+	return ghConfig.ConfigDir()
+}

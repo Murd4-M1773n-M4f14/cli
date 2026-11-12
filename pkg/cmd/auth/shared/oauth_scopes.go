@@ -3,12 +3,11 @@ package shared
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/safeurl"
 )
 
 type MissingScopesError struct {
@@ -28,37 +27,49 @@ func (e MissingScopesError) Error() string {
 	return "missing required scopes " + scopes
 }
 
-type httpClient interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-func HasMinimumScopes(httpClient httpClient, hostname, authToken string) error {
-	apiEndpoint := ghinstance.RESTPrefix(hostname)
-
-	req, err := http.NewRequest("GET", apiEndpoint, nil)
+// GetScopes performs a GitHub API request and returns the value of the X-Oauth-Scopes header.
+//
+// The token is passed explicitly because this runs before the token is stored in config, so
+// the transport has nothing to attach. The transport only sets Authorization when it is
+// absent, so the header set here wins.
+func GetScopes(httpClient *http.Client, hostname, authToken string) (string, error) {
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	res, err := api.NewClientFromHTTP(httpClient).Request(hostname, http.MethodGet, safeurl.NewImmutableSafeURL("").String(), nil,
+		api.WithHeader("Authorization", "token "+authToken))
 	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "token "+authToken)
-
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return err
+		return "", err
 	}
 
 	defer func() {
 		// Ensure the response body is fully read and closed
 		// before we reconnect, so that we reuse the same TCPconnection.
-		_, _ = io.Copy(ioutil.Discard, res.Body)
+		_, _ = io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 	}()
 
 	if res.StatusCode != 200 {
-		return api.HandleHTTPError(res)
+		return "", api.UnexpectedStatusError(res)
 	}
 
-	scopesHeader := res.Header.Get("X-Oauth-Scopes")
+	return res.Header.Get("X-Oauth-Scopes"), nil
+}
+
+// HasMinimumScopes performs a GitHub API request and returns an error if the token used in the request
+// lacks the minimum required scopes for performing API operations with gh.
+func HasMinimumScopes(httpClient *http.Client, hostname, authToken string) error {
+	scopesHeader, err := GetScopes(httpClient, hostname, authToken)
+	if err != nil {
+		return err
+	}
+
+	return HeaderHasMinimumScopes(scopesHeader)
+}
+
+// HeaderHasMinimumScopes parses the comma separated scopesHeader string and returns an error
+// if it lacks the minimum required scopes for performing API operations with gh.
+func HeaderHasMinimumScopes(scopesHeader string) error {
 	if scopesHeader == "" {
 		// if the token reports no scopes, assume that it's an integration token and give up on
 		// detecting its capabilities
@@ -70,7 +81,7 @@ func HasMinimumScopes(httpClient httpClient, hostname, authToken string) error {
 		"read:org":  false,
 		"admin:org": false,
 	}
-	for _, s := range strings.Split(scopesHeader, ",") {
+	for s := range strings.SplitSeq(scopesHeader, ",") {
 		search[strings.TrimSpace(s)] = true
 	}
 

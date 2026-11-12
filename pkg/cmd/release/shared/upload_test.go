@@ -1,6 +1,15 @@
 package shared
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"testing"
+
+	"github.com/cli/cli/v2/internal/safeurl"
+)
 
 func Test_typeForFilename(t *testing.T) {
 	tests := []struct {
@@ -66,4 +75,51 @@ func Test_typeForFilename(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_uploadWithDelete_retry(t *testing.T) {
+	retryInterval = 0
+	ctx := context.Background()
+
+	tries := 0
+	client := &http.Client{Transport: funcTripper(func(req *http.Request) (*http.Response, error) {
+		tries++
+		if tries == 1 {
+			return nil, errors.New("made up exception")
+		} else if tries == 2 {
+			return &http.Response{
+				Request:    req,
+				StatusCode: 500,
+				Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+			}, nil
+		}
+		return &http.Response{
+			Request:    req,
+			StatusCode: 200,
+			Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+		}, nil
+	})}
+	err := uploadWithDelete(ctx, client, "github.com", safeurl.NewImmutableSafeURL("http://example.com/upload"), AssetForUpload{
+		Name:  "asset",
+		Label: "",
+		Size:  8,
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewBufferString(`somebody`)), nil
+		},
+		MIMEType: "application/octet-stream",
+	})
+	if err != nil {
+		t.Errorf("uploadWithDelete() error: %v", err)
+	}
+	if tries != 3 {
+		t.Errorf("tries = %d, expected %d", tries, 3)
+	}
+}
+
+// funcTripper drives uploadWithDelete from a plain function. It is a RoundTripper rather than
+// a Do-er because the upload path takes a concrete *http.Client, which is what api.Client needs.
+type funcTripper func(*http.Request) (*http.Response, error)
+
+func (f funcTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

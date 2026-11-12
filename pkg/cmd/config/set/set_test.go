@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
@@ -46,9 +47,11 @@ func TestNewCmdConfigSet(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			_ = config.StubWriteConfig(t)
+
 			f := &cmdutil.Factory{
-				Config: func() (config.Config, error) {
-					return config.ConfigStub{}, nil
+				Config: func() (gh.Config, error) {
+					return config.NewMockConfig(), nil
 				},
 			}
 
@@ -94,7 +97,7 @@ func Test_setRun(t *testing.T) {
 		{
 			name: "set key value",
 			input: &SetOptions{
-				Config: config.ConfigStub{},
+				Config: config.NewMockConfig(),
 				Key:    "editor",
 				Value:  "vim",
 			},
@@ -103,7 +106,7 @@ func Test_setRun(t *testing.T) {
 		{
 			name: "set key value scoped by host",
 			input: &SetOptions{
-				Config:   config.ConfigStub{},
+				Config:   config.NewMockConfig(),
 				Hostname: "github.com",
 				Key:      "editor",
 				Value:    "vim",
@@ -111,9 +114,50 @@ func Test_setRun(t *testing.T) {
 			expectedValue: "vim",
 		},
 		{
+			name: "set existing global setting scoped by host",
+			input: &SetOptions{
+				Config:   config.NewMockConfig(),
+				Hostname: "github.com",
+				Key:      "prompt",
+				Value:    "disabled",
+			},
+			expectedValue: "disabled",
+		},
+		{
+			name: "set api_host scoped by host",
+			input: &SetOptions{
+				Config:   config.NewMockConfig(),
+				Hostname: "github.example.com",
+				Key:      "api_host",
+				Value:    "api-gateway.example.com",
+			},
+			expectedValue: "api-gateway.example.com",
+		},
+		{
+			name: "set api_host without hostname",
+			input: &SetOptions{
+				Config: config.NewMockConfig(),
+				Key:    "api_host",
+				Value:  "api-gateway.example.com",
+			},
+			wantsErr: true,
+			errMsg:   "--host required when setting api_host",
+		},
+		{
+			name: "set global key with hostname",
+			input: &SetOptions{
+				Config:   config.NewMockConfig(),
+				Hostname: "github.example.com",
+				Key:      "clipboard",
+				Value:    "enabled",
+			},
+			wantsErr: true,
+			errMsg:   "--host cannot be used when setting clipboard",
+		},
+		{
 			name: "set unknown key",
 			input: &SetOptions{
-				Config: config.ConfigStub{},
+				Config: config.NewMockConfig(),
 				Key:    "unknownKey",
 				Value:  "someValue",
 			},
@@ -123,7 +167,7 @@ func Test_setRun(t *testing.T) {
 		{
 			name: "set invalid value",
 			input: &SetOptions{
-				Config: config.ConfigStub{},
+				Config: config.NewMockConfig(),
 				Key:    "git_protocol",
 				Value:  "invalid",
 			},
@@ -132,10 +176,12 @@ func Test_setRun(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		io, _, stdout, stderr := iostreams.Test()
-		tt.input.IO = io
-
 		t.Run(tt.name, func(t *testing.T) {
+			_ = config.StubWriteConfig(t)
+
+			ios, _, stdout, stderr := iostreams.Test()
+			tt.input.IO = ios
+
 			err := setRun(tt.input)
 			if tt.wantsErr {
 				assert.EqualError(t, err, tt.errMsg)
@@ -145,13 +191,75 @@ func Test_setRun(t *testing.T) {
 			assert.Equal(t, tt.stdout, stdout.String())
 			assert.Equal(t, tt.stderr, stderr.String())
 
-			val, err := tt.input.Config.Get(tt.input.Hostname, tt.input.Key)
-			assert.NoError(t, err)
-			assert.Equal(t, tt.expectedValue, val)
-
-			val, err = tt.input.Config.Get("", "_written")
-			assert.NoError(t, err)
-			assert.Equal(t, "true", val)
+			optionalEntry := tt.input.Config.GetOrDefault(tt.input.Hostname, tt.input.Key)
+			entry := optionalEntry.Expect("expected a value to be set")
+			assert.Equal(t, tt.expectedValue, entry.Value)
+			assert.Equal(t, gh.ConfigUserProvided, entry.Source)
 		})
 	}
+}
+
+func Test_ValidateValue(t *testing.T) {
+	err := ValidateValue("git_protocol", "sshpps")
+	assert.EqualError(t, err, "invalid value")
+
+	err = ValidateValue("git_protocol", "ssh")
+	assert.NoError(t, err)
+
+	err = ValidateValue("editor", "vim")
+	assert.NoError(t, err)
+
+	err = ValidateValue("clipboard", "sometimes")
+	assert.EqualError(t, err, "invalid value")
+
+	err = ValidateValue("clipboard", "enabled")
+	assert.NoError(t, err)
+
+	err = ValidateValue("got", "123")
+	assert.NoError(t, err)
+
+	err = ValidateValue("http_unix_socket", "really_anything/is/allowed/and/net.Dial\\(...\\)/will/ultimately/validate")
+	assert.NoError(t, err)
+}
+
+func Test_ValidateKey(t *testing.T) {
+	err := ValidateKey("invalid")
+	assert.EqualError(t, err, "invalid key")
+
+	err = ValidateKey("git_protocol")
+	assert.NoError(t, err)
+
+	err = ValidateKey("editor")
+	assert.NoError(t, err)
+
+	err = ValidateKey("prompt")
+	assert.NoError(t, err)
+
+	err = ValidateKey("pager")
+	assert.NoError(t, err)
+
+	err = ValidateKey("http_unix_socket")
+	assert.NoError(t, err)
+
+	err = ValidateKey("browser")
+	assert.NoError(t, err)
+
+	err = ValidateKey("api_host")
+	assert.NoError(t, err)
+
+	err = ValidateKey("clipboard")
+	assert.NoError(t, err)
+}
+
+func Test_validateScope(t *testing.T) {
+	assert.EqualError(t, validateScope("api_host", ""), "--host required when setting api_host")
+	assert.NoError(t, validateScope("api_host", "github.example.com"))
+	assert.EqualError(t, validateScope("clipboard", "github.com"), "--host cannot be used when setting clipboard")
+	assert.NoError(t, validateScope("clipboard", ""))
+	assert.NoError(t, validateScope("prompt", "github.com"))
+	assert.NoError(t, validateScope("prefer_editor_prompt", "github.com"))
+	assert.NoError(t, validateScope("telemetry", "github.com"))
+	assert.NoError(t, validateScope("editor", "github.com"))
+	assert.NoError(t, validateScope("editor", ""))
+	assert.NoError(t, validateScope("unknown", "github.com"))
 }

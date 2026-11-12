@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"strings"
+	"net/url"
 
+	"github.com/atotto/clipboard"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghinstance"
-	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/cli/oauth"
+
+	ghauth "github.com/cli/go-gh/v2/pkg/auth"
 )
 
 var (
@@ -22,88 +25,77 @@ var (
 	oauthClientSecret = "34ddeff2b558a23d38fba8a6de74f086ede1cc0b"
 )
 
-type iconfig interface {
-	Set(string, string, string) error
-	Write() error
+// AuthResult carries the outcome of AuthFlow. Refreshable is set only when the server issued a refresh token, so
+// callers can store a refreshable credential in that case and a plain token otherwise.
+type AuthResult struct {
+	Token       string
+	Username    string
+	Refreshable *gh.Credential
 }
 
-func AuthFlowWithConfig(cfg iconfig, IO *iostreams.IOStreams, hostname, notice string, additionalScopes []string) (string, error) {
-	// TODO this probably shouldn't live in this package. It should probably be in a new package that
-	// depends on both iostreams and config.
-	stderr := IO.ErrOut
-	cs := IO.ColorScheme()
-
-	token, userLogin, err := authFlow(hostname, IO, notice, additionalScopes)
-	if err != nil {
-		return "", err
-	}
-
-	err = cfg.Set(hostname, "user", userLogin)
-	if err != nil {
-		return "", err
-	}
-	err = cfg.Set(hostname, "oauth_token", token)
-	if err != nil {
-		return "", err
-	}
-
-	err = cfg.Write()
-	if err != nil {
-		return "", err
-	}
-
-	fmt.Fprintf(stderr, "%s Authentication complete. %s to continue...\n",
-		cs.SuccessIcon(), cs.Bold("Press Enter"))
-	_ = waitForEnter(IO.In)
-
-	return token, nil
-}
-
-func authFlow(oauthHost string, IO *iostreams.IOStreams, notice string, additionalScopes []string) (string, string, error) {
+// AuthFlow initiates an OAuth device or web application flow to acquire a
+// token. The provided HTTP client should be a plain client that does not set
+// auth or other headers. When requestRefreshToken is true, gh asks the server
+// for an expiring, refreshable credential; the server may still issue a
+// non-expiring token, in which case AuthResult.Refreshable is nil.
+func AuthFlow(httpClient *http.Client, oauthHost string, IO *iostreams.IOStreams, notice string, additionalScopes []string, isInteractive bool, b browser.Browser, isCopyToClipboard bool, requestRefreshToken bool) (*AuthResult, error) {
 	w := IO.ErrOut
 	cs := IO.ColorScheme()
-
-	httpClient := http.DefaultClient
-	if envDebug := os.Getenv("DEBUG"); envDebug != "" {
-		logTraffic := strings.Contains(envDebug, "api") || strings.Contains(envDebug, "oauth")
-		httpClient.Transport = api.VerboseLog(IO.ErrOut, logTraffic, IO.ColorEnabled())(httpClient.Transport)
-	}
 
 	minimumScopes := []string{"repo", "read:org", "gist"}
 	scopes := append(minimumScopes, additionalScopes...)
 
-	callbackURI := "http://127.0.0.1/callback"
-	if ghinstance.IsEnterprise(oauthHost) {
-		// the OAuth app on Enterprise hosts is still registered with a legacy callback URL
-		// see https://github.com/cli/cli/pull/222, https://github.com/cli/cli/pull/650
-		callbackURI = "http://localhost/"
+	host, err := oauth.NewGitHubHost(ghinstance.HostPrefix(oauthHost))
+	if err != nil {
+		return nil, err
 	}
 
 	flow := &oauth.Flow{
-		Hostname:     oauthHost,
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
-		CallbackURI:  callbackURI,
-		Scopes:       scopes,
+		Host:                host,
+		ClientID:            oauthClientID,
+		ClientSecret:        oauthClientSecret,
+		CallbackURI:         getCallbackURI(oauthHost),
+		Scopes:              scopes,
+		RequestRefreshToken: requestRefreshToken,
 		DisplayCode: func(code, verificationURL string) error {
+			if isCopyToClipboard {
+				err := clipboard.WriteAll(code)
+				if err == nil {
+					fmt.Fprintf(w, "%s One-time code (%s) copied to clipboard\n", cs.Yellow("!"), cs.Bold(code))
+					return nil
+				}
+				fmt.Fprintf(w, "%s Failed to copy one-time code to clipboard\n", cs.Red("!"))
+				fmt.Fprintf(w, "  %s\n", err)
+			}
 			fmt.Fprintf(w, "%s First copy your one-time code: %s\n", cs.Yellow("!"), cs.Bold(code))
 			return nil
 		},
-		BrowseURL: func(url string) error {
-			fmt.Fprintf(w, "- %s to open %s in your browser... ", cs.Bold("Press Enter"), oauthHost)
+		BrowseURL: func(authURL string) error {
+			if u, err := url.Parse(authURL); err == nil {
+				if u.Scheme != "http" && u.Scheme != "https" {
+					return fmt.Errorf("invalid URL: %s", authURL)
+				}
+			} else {
+				return err
+			}
+
+			if !isInteractive {
+				fmt.Fprintf(w, "%s to continue in your web browser: %s\n", cs.Bold("Open this URL"), authURL)
+				return nil
+			}
+
+			fmt.Fprintf(w, "%s to open %s in your browser... ", cs.Bold("Press Enter"), authURL)
 			_ = waitForEnter(IO.In)
 
-			// FIXME: read the browser from cmd Factory rather than recreating it
-			browser := cmdutil.NewBrowser(os.Getenv("BROWSER"), IO.Out, IO.ErrOut)
-			if err := browser.Browse(url); err != nil {
-				fmt.Fprintf(w, "%s Failed opening a web browser at %s\n", cs.Red("!"), url)
+			if err := b.Browse(authURL); err != nil {
+				fmt.Fprintf(w, "%s Failed opening a web browser at %s\n", cs.Red("!"), authURL)
 				fmt.Fprintf(w, "  %s\n", err)
 				fmt.Fprint(w, "  Please try entering the URL in your browser manually\n")
 			}
 			return nil
 		},
 		WriteSuccessHTML: func(w io.Writer) {
-			fmt.Fprintln(w, oauthSuccessPage)
+			fmt.Fprint(w, oauthSuccessPage)
 		},
 		HTTPClient: httpClient,
 		Stdin:      IO.In,
@@ -112,22 +104,57 @@ func authFlow(oauthHost string, IO *iostreams.IOStreams, notice string, addition
 
 	fmt.Fprintln(w, notice)
 
+	// Anchor any expiring token's lifetime to the instant before the flow begins. DetectFlow blocks through the
+	// user's browser interaction and the server issues the token at the end, so this instant is at or before issuance
+	// and never overestimates the expiry. Use UTC so the derived absolute expiry matches the canonical UTC form gh
+	// stores and displays.
+	requestedAt := timeNow().UTC()
 	token, err := flow.DetectFlow()
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
-	userLogin, err := getViewer(oauthHost, token.Token)
+	userLogin, err := getViewer(httpClient, oauthHost, token.Token)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 
-	return token.Token, userLogin, nil
+	return authResultFromToken(token, userLogin, requestedAt), nil
 }
 
-func getViewer(hostname, token string) (string, error) {
-	http := api.NewClient(api.AddHeader("Authorization", fmt.Sprintf("token %s", token)))
-	return api.CurrentLoginName(http, hostname)
+func getCallbackURI(oauthHost string) string {
+	callbackURI := "http://127.0.0.1/callback"
+	if ghauth.IsEnterprise(oauthHost) {
+		// the OAuth app on Enterprise hosts is still registered with a legacy callback URL
+		// see https://github.com/cli/cli/pull/222, https://github.com/cli/cli/pull/650
+		callbackURI = "http://localhost/"
+	}
+	return callbackURI
+}
+
+type cfg struct {
+	token string
+}
+
+func (c cfg) ActiveTokenWithRefresh(hostname string) (gh.Credential, gh.RefreshStatus, error) {
+	return gh.Credential{Token: c.token}, gh.RefreshStatusInapplicable, nil
+}
+
+// HostForAPIHost never resolves, because the token here is supplied directly by
+// the login flow and is used for whatever host the request is aimed at.
+func (c cfg) HostForAPIHost(string) (string, bool) {
+	return "", false
+}
+
+// APIHostForHost never resolves for the same reason as HostForAPIHost.
+func (c cfg) APIHostForHost(string) (string, bool) {
+	return "", false
+}
+
+func getViewer(httpClient *http.Client, hostname, token string) (string, error) {
+	authedClient := *httpClient
+	authedClient.Transport = api.AddAuthTokenHeaderWithRefresh(httpClient.Transport, cfg{token: token})
+	return api.CurrentLoginName(api.NewClientFromHTTP(&authedClient), hostname)
 }
 
 func waitForEnter(r io.Reader) error {

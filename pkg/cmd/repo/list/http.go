@@ -5,9 +5,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/pkg/githubsearch"
 	"github.com/shurcooL/githubv4"
+
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/pkg/search"
 )
 
 type RepositoryList struct {
@@ -18,27 +19,24 @@ type RepositoryList struct {
 }
 
 type FilterOptions struct {
-	Visibility  string // private, public
+	Visibility  string // private, public, internal
 	Fork        bool
 	Source      bool
 	Language    string
-	Topic       string
+	Topic       []string
 	Archived    bool
 	NonArchived bool
 	Fields      []string
 }
 
 func listRepos(client *http.Client, hostname string, limit int, owner string, filter FilterOptions) (*RepositoryList, error) {
-	if filter.Language != "" || filter.Archived || filter.NonArchived || filter.Topic != "" {
+	if filter.Language != "" || filter.Archived || filter.NonArchived || len(filter.Topic) > 0 || filter.Visibility == "internal" {
 		return searchRepos(client, hostname, limit, owner, filter)
 	}
 
-	perPage := limit
-	if perPage > 100 {
-		perPage = 100
-	}
+	perPage := min(limit, 100)
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"perPage": githubv4.Int(perPage),
 	}
 
@@ -137,12 +135,9 @@ func searchRepos(client *http.Client, hostname string, limit int, owner string, 
 		}
 	}`, api.RepositoryGraphQL(filter.Fields))
 
-	perPage := limit
-	if perPage > 100 {
-		perPage = 100
-	}
+	perPage := min(limit, 100)
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"query":   githubv4.String(searchQuery(owner, filter)),
 		"perPage": githubv4.Int(perPage),
 	}
@@ -179,41 +174,38 @@ pagination:
 }
 
 func searchQuery(owner string, filter FilterOptions) string {
-	q := githubsearch.NewQuery()
-	q.SortBy(githubsearch.UpdatedAt, githubsearch.Desc)
-
 	if owner == "" {
-		q.OwnedBy("@me")
-	} else {
-		q.OwnedBy(owner)
+		owner = "@me"
 	}
 
+	fork := "true"
 	if filter.Fork {
-		q.OnlyForks()
-	} else {
-		q.IncludeForks(!filter.Source)
+		fork = "only"
+	} else if filter.Source {
+		fork = "false"
 	}
 
-	if filter.Language != "" {
-		q.SetLanguage(filter.Language)
-	}
-
-	if filter.Topic != "" {
-		q.SetTopic(filter.Topic)
-	}
-
-	switch filter.Visibility {
-	case "public":
-		q.SetVisibility(githubsearch.Public)
-	case "private":
-		q.SetVisibility(githubsearch.Private)
-	}
-
+	var archived *bool
 	if filter.Archived {
-		q.SetArchived(true)
-	} else if filter.NonArchived {
-		q.SetArchived(false)
+		trueBool := true
+		archived = &trueBool
+	}
+	if filter.NonArchived {
+		falseBool := false
+		archived = &falseBool
 	}
 
-	return q.String()
+	q := search.Query{
+		Keywords: []string{"sort:updated-desc"},
+		Qualifiers: search.Qualifiers{
+			Archived: archived,
+			Fork:     fork,
+			Is:       []string{filter.Visibility},
+			Language: filter.Language,
+			Topic:    filter.Topic,
+			User:     []string{owner},
+		},
+	}
+
+	return q.StandardSearchString()
 }

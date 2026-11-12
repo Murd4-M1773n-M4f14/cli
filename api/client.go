@@ -1,112 +1,37 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"maps"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 
-	"github.com/cli/cli/v2/internal/ghinstance"
-	"github.com/henvic/httpretty"
-	"github.com/shurcooL/graphql"
+	ghAPI "github.com/cli/go-gh/v2/pkg/api"
+	ghauth "github.com/cli/go-gh/v2/pkg/auth"
 )
 
-// ClientOption represents an argument to NewClient
-type ClientOption = func(http.RoundTripper) http.RoundTripper
+const (
+	apiVersion      = "X-GitHub-Api-Version"
+	apiVersionValue = "2022-11-28"
+	authorization   = "Authorization"
+	cacheTTL        = "X-GH-CACHE-TTL"
+	graphqlFeatures = "GraphQL-Features"
+	features        = "merge_queue"
+	userAgent       = "User-Agent"
+)
 
-// NewHTTPClient initializes an http.Client
-func NewHTTPClient(opts ...ClientOption) *http.Client {
-	tr := http.DefaultTransport
-	for _, opt := range opts {
-		tr = opt(tr)
-	}
-	return &http.Client{Transport: tr}
-}
+var linkRE = regexp.MustCompile(`<([^>]+)>;\s*rel="([^"]+)"`)
 
-// NewClient initializes a Client
-func NewClient(opts ...ClientOption) *Client {
-	client := &Client{http: NewHTTPClient(opts...)}
-	return client
-}
-
-// NewClientFromHTTP takes in an http.Client instance
 func NewClientFromHTTP(httpClient *http.Client) *Client {
 	client := &Client{http: httpClient}
 	return client
 }
 
-// AddHeader turns a RoundTripper into one that adds a request header
-func AddHeader(name, value string) ClientOption {
-	return func(tr http.RoundTripper) http.RoundTripper {
-		return &funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
-			if req.Header.Get(name) == "" {
-				req.Header.Add(name, value)
-			}
-			return tr.RoundTrip(req)
-		}}
-	}
-}
-
-// AddHeaderFunc is an AddHeader that gets the string value from a function
-func AddHeaderFunc(name string, getValue func(*http.Request) (string, error)) ClientOption {
-	return func(tr http.RoundTripper) http.RoundTripper {
-		return &funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
-			if req.Header.Get(name) != "" {
-				return tr.RoundTrip(req)
-			}
-			value, err := getValue(req)
-			if err != nil {
-				return nil, err
-			}
-			if value != "" {
-				req.Header.Add(name, value)
-			}
-			return tr.RoundTrip(req)
-		}}
-	}
-}
-
-// VerboseLog enables request/response logging within a RoundTripper
-func VerboseLog(out io.Writer, logTraffic bool, colorize bool) ClientOption {
-	logger := &httpretty.Logger{
-		Time:            true,
-		TLS:             false,
-		Colors:          colorize,
-		RequestHeader:   logTraffic,
-		RequestBody:     logTraffic,
-		ResponseHeader:  logTraffic,
-		ResponseBody:    logTraffic,
-		Formatters:      []httpretty.Formatter{&httpretty.JSONFormatter{}},
-		MaxResponseBody: 10000,
-	}
-	logger.SetOutput(out)
-	logger.SetBodyFilter(func(h http.Header) (skip bool, err error) {
-		return !inspectableMIMEType(h.Get("Content-Type")), nil
-	})
-	return logger.RoundTripper
-}
-
-// ReplaceTripper substitutes the underlying RoundTripper with a custom one
-func ReplaceTripper(tr http.RoundTripper) ClientOption {
-	return func(http.RoundTripper) http.RoundTripper {
-		return tr
-	}
-}
-
-type funcTripper struct {
-	roundTrip func(*http.Request) (*http.Response, error)
-}
-
-func (tr funcTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return tr.roundTrip(req)
-}
-
-// Client facilitates making HTTP requests to the GitHub API
 type Client struct {
 	http *http.Client
 }
@@ -115,221 +40,389 @@ func (c *Client) HTTP() *http.Client {
 	return c.http
 }
 
-type graphQLResponse struct {
-	Data   interface{}
-	Errors []GraphQLError
-}
-
-// GraphQLError is a single error returned in a GraphQL response
 type GraphQLError struct {
-	Type    string
-	Message string
-	// Path []interface // mixed strings and numbers
+	*ghAPI.GraphQLError
 }
 
-// GraphQLErrorResponse contains errors returned in a GraphQL response
-type GraphQLErrorResponse struct {
-	Errors []GraphQLError
-}
-
-func (gr GraphQLErrorResponse) Error() string {
-	errorMessages := make([]string, 0, len(gr.Errors))
-	for _, e := range gr.Errors {
-		errorMessages = append(errorMessages, e.Message)
-	}
-	return fmt.Sprintf("GraphQL error: %s", strings.Join(errorMessages, "\n"))
-}
-
-// HTTPError is an error returned by a failed API call
 type HTTPError struct {
-	StatusCode  int
-	RequestURL  *url.URL
-	Message     string
-	OAuthScopes string
-	Errors      []HTTPErrorItem
+	*ghAPI.HTTPError
+	scopesSuggestion string
 }
 
-type HTTPErrorItem struct {
-	Message  string
-	Resource string
-	Field    string
-	Code     string
+func (err HTTPError) ScopesSuggestion() string {
+	return err.scopesSuggestion
 }
 
-func (err HTTPError) Error() string {
-	if msgs := strings.SplitN(err.Message, "\n", 2); len(msgs) > 1 {
-		return fmt.Sprintf("HTTP %d: %s (%s)\n%s", err.StatusCode, msgs[0], err.RequestURL, msgs[1])
-	} else if err.Message != "" {
-		return fmt.Sprintf("HTTP %d: %s (%s)", err.StatusCode, err.Message, err.RequestURL)
+// RequestOption configures a single request made through Request, RequestWithContext or GraphQL.
+type RequestOption func(*requestConfig)
+
+// requestConfig accumulates the effect of the RequestOptions applied to one request.
+type requestConfig struct {
+	headers           map[string]string
+	endpointScopes    string
+	noFollowRedirects bool
+}
+
+// WithHeader sets a header on the request, taking precedence over any header of the same name
+// that the underlying transport would otherwise supply.
+func WithHeader(name, value string) RequestOption {
+	return func(cfg *requestConfig) {
+		cfg.headers[name] = value
 	}
-	return fmt.Sprintf("HTTP %d (%s)", err.StatusCode, err.RequestURL)
 }
 
-// GraphQL performs a GraphQL request and parses the response
-func (c Client) GraphQL(hostname string, query string, variables map[string]interface{}, data interface{}) error {
-	reqBody, err := json.Marshal(map[string]interface{}{"query": query, "variables": variables})
+// WithoutFollowingRedirects stops the request from following redirects. When a redirect is
+// encountered, the request fails with an HTTPError carrying the redirect status code and headers
+// rather than following the redirect. This matters for requests where following a redirect
+// silently changes the meaning of the request: Go's default policy converts methods other than
+// GET or HEAD (e.g. DELETE) into a GET when it follows a 301/302/303, so a caller deleting a renamed
+// resource would receive a success response while having deleted nothing.
+//
+// This option applies only to the REST request surface (Request and RequestWithContext). It has no
+// effect on GraphQL methods, which do not encounter redirects in practice.
+func WithoutFollowingRedirects() RequestOption {
+	return func(cfg *requestConfig) {
+		cfg.noFollowRedirects = true
+	}
+}
+
+// WithEndpointScopes adds OAuth scopes to a 4xx error as if the server endpoint had returned them.
+// This improves error messaging for endpoints that do not explicitly list the scopes they need, and
+// is the Request equivalent of calling EndpointNeedsScopes on a raw response.
+func WithEndpointScopes(scopes string) RequestOption {
+	return func(cfg *requestConfig) {
+		cfg.endpointScopes = scopes
+	}
+}
+
+func newRequestConfig(opts []RequestOption) requestConfig {
+	cfg := requestConfig{headers: map[string]string{}}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// GraphQL performs a GraphQL request using the query string and parses the response into data receiver. If there are errors in the response,
+// GraphQLError will be returned, but the receiver will also be partially populated.
+func (c Client) GraphQL(hostname string, query string, variables map[string]any, data any, opts ...RequestOption) error {
+	cfg := newRequestConfig(opts)
+	clientOpts := clientOptions(hostname, c.http.Transport)
+	clientOpts.Headers[graphqlFeatures] = features
+	maps.Copy(clientOpts.Headers, cfg.headers)
+	gqlClient, err := ghAPI.NewGraphQLClient(clientOpts)
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequest("POST", ghinstance.GraphQLEndpoint(hostname), bytes.NewBuffer(reqBody))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	return handleResponse(resp, data)
+	return handleResponse(gqlClient.Do(query, variables, data))
 }
 
-func graphQLClient(h *http.Client, hostname string) *graphql.Client {
-	return graphql.NewClient(ghinstance.GraphQLEndpoint(hostname), h)
+// Mutate performs a GraphQL mutation based on a struct and parses the response with the same struct as the receiver. If there are errors in the response,
+// GraphQLError will be returned, but the receiver will also be partially populated.
+func (c Client) Mutate(hostname, name string, mutation any, variables map[string]any) error {
+	opts := clientOptions(hostname, c.http.Transport)
+	opts.Headers[graphqlFeatures] = features
+	gqlClient, err := ghAPI.NewGraphQLClient(opts)
+	if err != nil {
+		return err
+	}
+	return handleResponse(gqlClient.Mutate(name, mutation, variables))
+}
+
+// Query performs a GraphQL query based on a struct and parses the response with the same struct as the receiver. If there are errors in the response,
+// GraphQLError will be returned, but the receiver will also be partially populated.
+func (c Client) Query(hostname, name string, query any, variables map[string]any) error {
+	opts := clientOptions(hostname, c.http.Transport)
+	opts.Headers[graphqlFeatures] = features
+	gqlClient, err := ghAPI.NewGraphQLClient(opts)
+	if err != nil {
+		return err
+	}
+	return handleResponse(gqlClient.Query(name, query, variables))
+}
+
+// QueryWithContext performs a GraphQL query based on a struct and parses the response with the same struct as the receiver. If there are errors in the response,
+// GraphQLError will be returned, but the receiver will also be partially populated.
+func (c Client) QueryWithContext(ctx context.Context, hostname, name string, query any, variables map[string]any) error {
+	opts := clientOptions(hostname, c.http.Transport)
+	opts.Headers[graphqlFeatures] = features
+	gqlClient, err := ghAPI.NewGraphQLClient(opts)
+	if err != nil {
+		return err
+	}
+	return handleResponse(gqlClient.QueryWithContext(ctx, name, query, variables))
 }
 
 // REST performs a REST request and parses the response.
-func (c Client) REST(hostname string, method string, p string, body io.Reader, data interface{}) error {
-	req, err := http.NewRequest(method, restURL(hostname, p), body)
+func (c Client) REST(hostname string, method string, p string, body io.Reader, data any) error {
+	opts := clientOptions(hostname, c.http.Transport)
+	restClient, err := ghAPI.NewRESTClient(opts)
 	if err != nil {
 		return err
 	}
+	return handleResponse(restClient.Do(method, p, body, data))
+}
 
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-
-	resp, err := c.http.Do(req)
+func (c Client) RESTWithNext(hostname string, method string, p string, body io.Reader, data any) (string, error) {
+	opts := clientOptions(hostname, c.http.Transport)
+	restClient, err := ghAPI.NewRESTClient(opts)
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	resp, err := restClient.Request(method, p, body)
+	if err != nil {
+		return "", handleResponse(err)
 	}
 	defer resp.Body.Close()
 
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
-	if !success {
-		return HandleHTTPError(resp)
+	if resp.StatusCode == http.StatusNoContent {
+		return "", nil
 	}
 
-	if resp.StatusCode == http.StatusNoContent {
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	err = json.Unmarshal(b, &data)
+	if err != nil {
+		return "", err
+	}
+
+	var next string
+	for _, m := range linkRE.FindAllStringSubmatch(resp.Header.Get("Link"), -1) {
+		if len(m) > 2 && m[2] == "next" {
+			next = m[1]
+		}
+	}
+
+	return next, nil
+}
+
+// Request performs a REST request and returns the response for the caller to consume.
+//
+// See RequestWithContext for the full semantics.
+func (c Client) Request(hostname string, method string, p string, body io.Reader, opts ...RequestOption) (*http.Response, error) {
+	return c.RequestWithContext(context.Background(), hostname, method, p, body, opts...)
+}
+
+// RequestWithContext performs a REST request and returns the response for the caller to consume,
+// rather than decoding it into a receiver as REST does. It exists for call sites that need access
+// to the response itself: streaming bodies, non-JSON bodies, response headers, or the status code
+// of a successful response.
+//
+// p may be a path relative to the host's REST endpoint, or an absolute URL. Prefer a relative path.
+// Absolute URLs are requested as given, which is correct for URLs supplied by the API itself, such
+// as asset and upload URLs, but means they do not benefit from host-level endpoint resolution.
+//
+// Responses outside the 2xx range are returned as an HTTPError and their body is closed. On success
+// the response is returned unread and the caller is responsible for closing its body.
+func (c Client) RequestWithContext(ctx context.Context, hostname string, method string, p string, body io.Reader, opts ...RequestOption) (*http.Response, error) {
+	cfg := newRequestConfig(opts)
+	clientOpts := clientOptions(hostname, c.http.Transport)
+	maps.Copy(clientOpts.Headers, cfg.headers)
+	if cfg.noFollowRedirects {
+		clientOpts.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+
+	restClient, err := ghAPI.NewRESTClient(clientOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := restClient.RequestWithContext(ctx, method, p, body)
+	if err != nil {
+		return nil, handleRequestError(err, cfg.endpointScopes)
+	}
+
+	return resp, nil
+}
+
+// DoRequest sends a request that the caller has already built, and returns the response for the
+// caller to consume. It applies the same error handling as Request.
+//
+// Prefer Request. DoRequest exists for the few call sites that must control something Request
+// cannot express. That is either a field of the request which is neither method, path, body nor
+// header, such as ContentLength and GetBody when uploading a release asset, or a property of the
+// client itself, such as CheckRedirect. Request delegates to go-gh, which builds a client of its
+// own from the transport alone, so a redirect policy set on the client passed to
+// NewClientFromHTTP only survives when the request is sent here.
+//
+// Because the caller supplies the URL, requests sent this way do not benefit from host-level
+// endpoint resolution, so it is only appropriate for absolute URLs.
+//
+// Only the endpoint scopes of any RequestOption are applied; headers are the caller's own to set
+// on the request they built.
+//
+// Responses outside the 2xx range are returned as an HTTPError and their body is closed. On success
+// the response is returned unread and the caller is responsible for closing its body.
+func (c Client) DoRequest(req *http.Request, opts ...RequestOption) (*http.Response, error) {
+	cfg := newRequestConfig(opts)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if !success {
+		defer resp.Body.Close()
+		if cfg.endpointScopes != "" {
+			EndpointNeedsScopes(resp, cfg.endpointScopes)
+		}
+		return nil, HandleHTTPError(resp)
+	}
+
+	return resp, nil
+}
+
+// HandleHTTPError parses a http.Response into a HTTPError.
+//
+// The caller is responsible to close the response body stream.
+func HandleHTTPError(resp *http.Response) error {
+	return handleResponse(ghAPI.HandleHTTPError(resp))
+}
+
+// UnexpectedStatusError reports a successful response whose status the caller did not expect.
+//
+// The request methods on Client convert every non-2xx response into an HTTPError, so a call site
+// that requires one specific status can only ever be surprised by a different 2xx. Passing such a
+// response to HandleHTTPError would ask an error parser to explain a success, so this is used
+// instead. The caller remains responsible for closing the response body stream.
+func UnexpectedStatusError(resp *http.Response) error {
+	if resp.Request != nil {
+		return fmt.Errorf("unexpected HTTP %d for %s %s", resp.StatusCode, resp.Request.Method, resp.Request.URL)
+	}
+	return fmt.Errorf("unexpected HTTP %d", resp.StatusCode)
+}
+
+// handleRequestError converts a request error into an HTTPError or GraphQLError, first adding any
+// endpoint scopes to the error's headers so that the scopes suggestion generated by handleResponse
+// accounts for them. This is the error-path equivalent of calling EndpointNeedsScopes on a response
+// before HandleHTTPError, which call sites can no longer do when the response never reaches them.
+func handleRequestError(err error, endpointScopes string) error {
+	if endpointScopes != "" {
+		if restErr, ok := errors.AsType[*ghAPI.HTTPError](err); ok && restErr.Headers != nil && restErr.StatusCode >= 400 && restErr.StatusCode < 500 {
+			oldScopes := restErr.Headers.Get("X-Accepted-Oauth-Scopes")
+			restErr.Headers.Set("X-Accepted-Oauth-Scopes", fmt.Sprintf("%s, %s", oldScopes, endpointScopes))
+		}
+	}
+	return handleResponse(err)
+}
+
+// handleResponse takes a ghAPI.HTTPError or ghAPI.GraphQLError and converts it into an
+// HTTPError or GraphQLError respectively.
+func handleResponse(err error) error {
+	if err == nil {
 		return nil
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(b, &data)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func restURL(hostname string, pathOrURL string) string {
-	if strings.HasPrefix(pathOrURL, "https://") || strings.HasPrefix(pathOrURL, "http://") {
-		return pathOrURL
-	}
-	return ghinstance.RESTPrefix(hostname) + pathOrURL
-}
-
-func handleResponse(resp *http.Response, data interface{}) error {
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
-
-	if !success {
-		return HandleHTTPError(resp)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	gr := &graphQLResponse{Data: data}
-	err = json.Unmarshal(body, &gr)
-	if err != nil {
-		return err
-	}
-
-	if len(gr.Errors) > 0 {
-		return &GraphQLErrorResponse{Errors: gr.Errors}
-	}
-	return nil
-}
-
-func HandleHTTPError(resp *http.Response) error {
-	httpError := HTTPError{
-		StatusCode:  resp.StatusCode,
-		RequestURL:  resp.Request.URL,
-		OAuthScopes: resp.Header.Get("X-Oauth-Scopes"),
-	}
-
-	if !jsonTypeRE.MatchString(resp.Header.Get("Content-Type")) {
-		httpError.Message = resp.Status
-		return httpError
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		httpError.Message = err.Error()
-		return httpError
-	}
-
-	var parsedBody struct {
-		Message string `json:"message"`
-		Errors  []json.RawMessage
-	}
-	if err := json.Unmarshal(body, &parsedBody); err != nil {
-		return httpError
-	}
-
-	var messages []string
-	if parsedBody.Message != "" {
-		messages = append(messages, parsedBody.Message)
-	}
-	for _, raw := range parsedBody.Errors {
-		switch raw[0] {
-		case '"':
-			var errString string
-			_ = json.Unmarshal(raw, &errString)
-			messages = append(messages, errString)
-			httpError.Errors = append(httpError.Errors, HTTPErrorItem{Message: errString})
-		case '{':
-			var errInfo HTTPErrorItem
-			_ = json.Unmarshal(raw, &errInfo)
-			msg := errInfo.Message
-			if errInfo.Code != "" && errInfo.Code != "custom" {
-				msg = fmt.Sprintf("%s.%s %s", errInfo.Resource, errInfo.Field, errorCodeToMessage(errInfo.Code))
-			}
-			if msg != "" {
-				messages = append(messages, msg)
-			}
-			httpError.Errors = append(httpError.Errors, errInfo)
+	if restErr, ok := errors.AsType[*ghAPI.HTTPError](err); ok {
+		return HTTPError{
+			HTTPError: restErr,
+			scopesSuggestion: generateScopesSuggestion(restErr.StatusCode,
+				restErr.Headers.Get("X-Accepted-Oauth-Scopes"),
+				restErr.Headers.Get("X-Oauth-Scopes"),
+				restErr.RequestURL.Hostname()),
 		}
 	}
-	httpError.Message = strings.Join(messages, "\n")
 
-	return httpError
+	if gqlErr, ok := errors.AsType[*ghAPI.GraphQLError](err); ok {
+		return GraphQLError{
+			GraphQLError: gqlErr,
+		}
+	}
+
+	return err
 }
 
-func errorCodeToMessage(code string) string {
-	// https://docs.github.com/en/rest/overview/resources-in-the-rest-api#client-errors
-	switch code {
-	case "missing", "missing_field":
-		return "is missing"
-	case "invalid", "unprocessable":
-		return "is invalid"
-	case "already_exists":
-		return "already exists"
-	default:
-		return code
+// ScopesSuggestion is an error messaging utility that prints the suggestion to request additional OAuth
+// scopes in case a server response indicates that there are missing scopes.
+func ScopesSuggestion(resp *http.Response) string {
+	return generateScopesSuggestion(resp.StatusCode,
+		resp.Header.Get("X-Accepted-Oauth-Scopes"),
+		resp.Header.Get("X-Oauth-Scopes"),
+		resp.Request.URL.Hostname())
+}
+
+// EndpointNeedsScopes adds additional OAuth scopes to an HTTP response as if they were returned from the
+// server endpoint. This improves HTTP 4xx error messaging for endpoints that don't explicitly list the
+// OAuth scopes they need.
+func EndpointNeedsScopes(resp *http.Response, s string) {
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		oldScopes := resp.Header.Get("X-Accepted-Oauth-Scopes")
+		resp.Header.Set("X-Accepted-Oauth-Scopes", fmt.Sprintf("%s, %s", oldScopes, s))
 	}
 }
 
-var jsonTypeRE = regexp.MustCompile(`[/+]json($|;)`)
+func generateScopesSuggestion(statusCode int, endpointNeedsScopes, tokenHasScopes, hostname string) string {
+	if statusCode < 400 || statusCode > 499 || statusCode == 422 {
+		return ""
+	}
 
-func inspectableMIMEType(t string) bool {
-	return strings.HasPrefix(t, "text/") || jsonTypeRE.MatchString(t)
+	if tokenHasScopes == "" {
+		return ""
+	}
+
+	gotScopes := map[string]struct{}{}
+	for s := range strings.SplitSeq(tokenHasScopes, ",") {
+		s = strings.TrimSpace(s)
+		gotScopes[s] = struct{}{}
+
+		// Certain scopes may be grouped under a single "top-level" scope. The following branch
+		// statements include these grouped/implied scopes when the top-level scope is encountered.
+		// See https://docs.github.com/en/developers/apps/building-oauth-apps/scopes-for-oauth-apps.
+		if s == "repo" {
+			gotScopes["repo:status"] = struct{}{}
+			gotScopes["repo_deployment"] = struct{}{}
+			gotScopes["public_repo"] = struct{}{}
+			gotScopes["repo:invite"] = struct{}{}
+			gotScopes["security_events"] = struct{}{}
+		} else if s == "user" {
+			gotScopes["read:user"] = struct{}{}
+			gotScopes["user:email"] = struct{}{}
+			gotScopes["user:follow"] = struct{}{}
+		} else if s == "codespace" {
+			gotScopes["codespace:secrets"] = struct{}{}
+		} else if after, ok := strings.CutPrefix(s, "admin:"); ok {
+			gotScopes["read:"+after] = struct{}{}
+			gotScopes["write:"+strings.TrimPrefix(s, "admin:")] = struct{}{}
+		} else if after, ok := strings.CutPrefix(s, "write:"); ok {
+			gotScopes["read:"+after] = struct{}{}
+		}
+	}
+
+	for s := range strings.SplitSeq(endpointNeedsScopes, ",") {
+		s = strings.TrimSpace(s)
+		if _, gotScope := gotScopes[s]; s == "" || gotScope {
+			continue
+		}
+		return fmt.Sprintf(
+			"This API operation needs the %[1]q scope. To request it, run:  gh auth refresh -h %[2]s -s %[1]s",
+			s,
+			ghauth.NormalizeHostname(hostname),
+		)
+	}
+
+	return ""
+}
+
+func clientOptions(hostname string, transport http.RoundTripper) ghAPI.ClientOptions {
+	// AuthToken, and Headers are being handled by transport,
+	// so let go-gh know that it does not need to resolve them.
+	opts := ghAPI.ClientOptions{
+		AuthToken: "none",
+		Headers: map[string]string{
+			authorization: "",
+			apiVersion:    apiVersionValue,
+		},
+		Host:               hostname,
+		SkipDefaultHeaders: true,
+		Transport:          transport,
+		LogIgnoreEnv:       true,
+	}
+	return opts
 }

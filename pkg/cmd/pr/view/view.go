@@ -1,29 +1,31 @@
 package view
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/browser"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/cli/cli/v2/pkg/markdown"
-	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
-type browser interface {
-	Browse(string) error
-}
-
 type ViewOptions struct {
 	IO      *iostreams.IOStreams
-	Browser browser
+	Browser browser.Browser
+	// TODO projectsV1Deprecation
+	// Remove this detector since it is only used for test validation.
+	Detector fd.Detector
 
 	Finder   shared.PRFinder
 	Exporter cmdutil.Exporter
@@ -31,31 +33,42 @@ type ViewOptions struct {
 	SelectorArg string
 	BrowserMode bool
 	Comments    bool
+
+	Now func() time.Time
 }
 
 func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Command {
 	opts := &ViewOptions{
 		IO:      f.IOStreams,
 		Browser: f.Browser,
+		Now:     time.Now,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "view [<number> | <url> | <branch>]",
 		Short: "View a pull request",
-		Long: heredoc.Doc(`
+		Long: heredoc.Docf(`
 			Display the title, body, and other information about a pull request.
 
 			Without an argument, the pull request that belongs to the current branch
 			is displayed.
 
-			With '--web', open the pull request in a web browser instead.
-		`),
+			When %[1]s--comments%[1]s is used, terminal output includes the pull request details, comments,
+			and reviews. When output is piped or redirected, only comments and reviews are printed.
+
+			With %[1]s--web%[1]s flag, open the pull request in a web browser instead.
+		`, "`"),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cmdutil.MutuallyExclusive("specify only one of --comments or --json",
+				opts.Comments, opts.Exporter != nil); err != nil {
+				return err
+			}
+
 			opts.Finder = shared.NewFinder(f)
 
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
-				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
+				return cmdutil.FlagErrorf("argument required when using the --repo flag")
 			}
 
 			if len(args) > 0 {
@@ -77,52 +90,52 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 }
 
 var defaultFields = []string{
-	"url", "number", "title", "state", "body", "author",
+	"url", "number", "title", "state", "body", "author", "autoMergeRequest",
 	"isDraft", "maintainerCanModify", "mergeable", "additions", "deletions", "commitsCount",
 	"baseRefName", "headRefName", "headRepositoryOwner", "headRepository", "isCrossRepository",
-	"reviewRequests", "reviews", "assignees", "labels", "projectCards", "milestone",
-	"comments", "reactionGroups",
+	"reviewRequests", "reviews", "assignees", "labels", "projectCards", "projectItems", "milestone",
+	"comments", "reactionGroups", "createdAt", "statusCheckRollup",
 }
 
 func viewRun(opts *ViewOptions) error {
 	findOptions := shared.FindOptions{
 		Selector: opts.SelectorArg,
 		Fields:   defaultFields,
+		Detector: opts.Detector,
 	}
 	if opts.BrowserMode {
 		findOptions.Fields = []string{"url"}
 	} else if opts.Exporter != nil {
 		findOptions.Fields = opts.Exporter.Fields()
 	}
-	pr, _, err := opts.Finder.Find(findOptions)
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
 	if err != nil {
 		return err
 	}
 
-	connectedToTerminal := opts.IO.IsStdoutTTY() && opts.IO.IsStderrTTY()
+	connectedToTerminal := opts.IO.IsStdoutTTY()
 
 	if opts.BrowserMode {
 		openURL := pr.URL
 		if connectedToTerminal {
-			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
+			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", text.DisplayURL(openURL))
 		}
 		return opts.Browser.Browse(openURL)
 	}
 
 	opts.IO.DetectTerminalTheme()
-
-	err = opts.IO.StartPager()
-	if err != nil {
-		return err
+	if err := opts.IO.StartPager(); err == nil {
+		defer opts.IO.StopPager()
+	} else {
+		fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
 	}
-	defer opts.IO.StopPager()
 
 	if opts.Exporter != nil {
 		return opts.Exporter.Write(opts.IO, pr)
 	}
 
 	if connectedToTerminal {
-		return printHumanPrPreview(opts, pr)
+		return printHumanPrPreview(opts, baseRepo, pr)
 	}
 
 	if opts.Comments {
@@ -144,7 +157,7 @@ func printRawPrPreview(io *iostreams.IOStreams, pr *api.PullRequest) error {
 
 	fmt.Fprintf(out, "title:\t%s\n", pr.Title)
 	fmt.Fprintf(out, "state:\t%s\n", prStateWithDraft(pr))
-	fmt.Fprintf(out, "author:\t%s\n", pr.Author.Login)
+	fmt.Fprintf(out, "author:\t%s\n", pr.Author.DisplayName())
 	fmt.Fprintf(out, "labels:\t%s\n", labels)
 	fmt.Fprintf(out, "assignees:\t%s\n", assignees)
 	fmt.Fprintf(out, "reviewers:\t%s\n", reviewers)
@@ -158,6 +171,15 @@ func printRawPrPreview(io *iostreams.IOStreams, pr *api.PullRequest) error {
 	fmt.Fprintf(out, "url:\t%s\n", pr.URL)
 	fmt.Fprintf(out, "additions:\t%s\n", cs.Green(strconv.Itoa(pr.Additions)))
 	fmt.Fprintf(out, "deletions:\t%s\n", cs.Red(strconv.Itoa(pr.Deletions)))
+	var autoMerge string
+	if pr.AutoMergeRequest == nil {
+		autoMerge = "disabled"
+	} else {
+		autoMerge = fmt.Sprintf("enabled\t%s\t%s",
+			pr.AutoMergeRequest.EnabledBy.Login,
+			strings.ToLower(pr.AutoMergeRequest.MergeMethod))
+	}
+	fmt.Fprintf(out, "auto-merge:\t%s\n", autoMerge)
 
 	fmt.Fprintln(out, "--")
 	fmt.Fprintln(out, pr.Body)
@@ -165,22 +187,36 @@ func printRawPrPreview(io *iostreams.IOStreams, pr *api.PullRequest) error {
 	return nil
 }
 
-func printHumanPrPreview(opts *ViewOptions, pr *api.PullRequest) error {
+func printHumanPrPreview(opts *ViewOptions, baseRepo ghrepo.Interface, pr *api.PullRequest) error {
 	out := opts.IO.Out
 	cs := opts.IO.ColorScheme()
 
 	// Header (Title and State)
-	fmt.Fprintf(out, "%s #%d\n", cs.Bold(pr.Title), pr.Number)
+	fmt.Fprintf(out, "%s %s#%d\n", cs.Bold(pr.Title), ghrepo.FullName(baseRepo), pr.Number)
 	fmt.Fprintf(out,
-		"%s • %s wants to merge %s into %s from %s • %s %s \n",
+		"%s • %s wants to merge %s into %s from %s • %s\n",
 		shared.StateTitleWithColor(cs, *pr),
-		pr.Author.Login,
-		utils.Pluralize(pr.Commits.TotalCount, "commit"),
+		pr.Author.DisplayName(),
+		text.Pluralize(pr.Commits.TotalCount, "commit"),
 		pr.BaseRefName,
 		pr.HeadRefName,
+		text.FuzzyAgo(opts.Now(), pr.CreatedAt),
+	)
+
+	// added/removed
+	fmt.Fprintf(out,
+		"%s %s",
 		cs.Green("+"+strconv.Itoa(pr.Additions)),
 		cs.Red("-"+strconv.Itoa(pr.Deletions)),
 	)
+
+	// checks
+	checks := pr.ChecksStatus()
+	if summary := shared.PrCheckStatusSummaryWithColor(cs, checks); summary != "" {
+		fmt.Fprintf(out, " • %s\n", summary)
+	} else {
+		fmt.Fprintln(out)
+	}
 
 	// Reactions
 	if reactions := shared.ReactionGroupList(pr.ReactionGroups); reactions != "" {
@@ -210,14 +246,38 @@ func printHumanPrPreview(opts *ViewOptions, pr *api.PullRequest) error {
 		fmt.Fprintln(out, pr.Milestone.Title)
 	}
 
+	// Auto-Merge status
+	autoMerge := pr.AutoMergeRequest
+	if autoMerge != nil {
+		var mergeMethod string
+		switch autoMerge.MergeMethod {
+		case "MERGE":
+			mergeMethod = "a merge commit"
+		case "REBASE":
+			mergeMethod = "rebase and merge"
+		case "SQUASH":
+			mergeMethod = "squash and merge"
+		default:
+			mergeMethod = fmt.Sprintf("an unknown merge method (%s)", autoMerge.MergeMethod)
+		}
+		fmt.Fprintf(out,
+			"%s %s by %s, using %s\n",
+			cs.Bold("Auto-merge:"),
+			cs.Green("enabled"),
+			autoMerge.EnabledBy.Login,
+			mergeMethod,
+		)
+	}
+
 	// Body
 	var md string
 	var err error
 	if pr.Body == "" {
-		md = fmt.Sprintf("\n  %s\n\n", cs.Gray("No description provided"))
+		md = fmt.Sprintf("\n  %s\n\n", cs.Muted("No description provided"))
 	} else {
-		style := markdown.GetStyle(opts.IO.TerminalTheme())
-		md, err = markdown.Render(pr.Body, style)
+		md, err = markdown.Render(pr.Body,
+			markdown.WithTheme(opts.IO.TerminalTheme()),
+			markdown.WithWrap(opts.IO.TerminalWidth()))
 		if err != nil {
 			return err
 		}
@@ -235,7 +295,7 @@ func printHumanPrPreview(opts *ViewOptions, pr *api.PullRequest) error {
 	}
 
 	// Footer
-	fmt.Fprintf(out, cs.Gray("View this pull request on GitHub: %s\n"), pr.URL)
+	fmt.Fprintf(out, cs.Muted("View this pull request on GitHub: %s\n"), pr.URL)
 
 	return nil
 }
@@ -256,26 +316,23 @@ type reviewerState struct {
 
 // formattedReviewerState formats a reviewerState with state color
 func formattedReviewerState(cs *iostreams.ColorScheme, reviewer *reviewerState) string {
-	state := reviewer.State
-	if state == dismissedReviewState {
+	var displayState string
+	switch reviewer.State {
+	case requestedReviewState:
+		displayState = cs.Yellow("Requested")
+	case approvedReviewState:
+		displayState = cs.Green("Approved")
+	case changesRequestedReviewState:
+		displayState = cs.Red("Changes requested")
+	case commentedReviewState, dismissedReviewState:
 		// Show "DISMISSED" review as "COMMENTED", since "dismissed" only makes
 		// sense when displayed in an events timeline but not in the final tally.
-		state = commentedReviewState
-	}
-
-	var colorFunc func(string) string
-	switch state {
-	case requestedReviewState:
-		colorFunc = cs.Yellow
-	case approvedReviewState:
-		colorFunc = cs.Green
-	case changesRequestedReviewState:
-		colorFunc = cs.Red
+		displayState = "Commented"
 	default:
-		colorFunc = func(str string) string { return str } // Do nothing
+		displayState = text.Title(reviewer.State)
 	}
 
-	return fmt.Sprintf("%s (%s)", reviewer.Name, colorFunc(strings.ReplaceAll(strings.Title(strings.ToLower(state)), "_", " ")))
+	return fmt.Sprintf("%s (%s)", reviewer.Name, displayState)
 }
 
 // prReviewerList generates a reviewer list with their last state
@@ -302,7 +359,7 @@ func parseReviewers(pr api.PullRequest) []*reviewerState {
 
 	for _, review := range pr.Reviews.Nodes {
 		if review.Author.Login != pr.Author.Login {
-			name := review.Author.Login
+			name := review.AuthorLogin()
 			if name == "" {
 				name = ghostName
 			}
@@ -315,7 +372,7 @@ func parseReviewers(pr api.PullRequest) []*reviewerState {
 
 	// Overwrite reviewer's state if a review request for the same reviewer exists.
 	for _, reviewRequest := range pr.ReviewRequests.Nodes {
-		name := reviewRequest.RequestedReviewer.LoginOrSlug()
+		name := reviewRequest.RequestedReviewer.DisplayName()
 		reviewerStates[name] = &reviewerState{
 			Name:  name,
 			State: requestedReviewState,
@@ -357,7 +414,7 @@ func prAssigneeList(pr api.PullRequest) string {
 
 	AssigneeNames := make([]string, 0, len(pr.Assignees.Nodes))
 	for _, assignee := range pr.Assignees.Nodes {
-		AssigneeNames = append(AssigneeNames, assignee.Login)
+		AssigneeNames = append(AssigneeNames, assignee.DisplayName())
 	}
 
 	list := strings.Join(AssigneeNames, ", ")
@@ -372,9 +429,14 @@ func prLabelList(pr api.PullRequest, cs *iostreams.ColorScheme) string {
 		return ""
 	}
 
+	// ignore case sort
+	sort.SliceStable(pr.Labels.Nodes, func(i, j int) bool {
+		return strings.ToLower(pr.Labels.Nodes[i].Name) < strings.ToLower(pr.Labels.Nodes[j].Name)
+	})
+
 	labelNames := make([]string, 0, len(pr.Labels.Nodes))
 	for _, label := range pr.Labels.Nodes {
-		labelNames = append(labelNames, cs.HexToRGB(label.Color, label.Name))
+		labelNames = append(labelNames, cs.Label(label.Color, label.Name))
 	}
 
 	list := strings.Join(labelNames, ", ")
@@ -385,12 +447,27 @@ func prLabelList(pr api.PullRequest, cs *iostreams.ColorScheme) string {
 }
 
 func prProjectList(pr api.PullRequest) string {
-	if len(pr.ProjectCards.Nodes) == 0 {
+	totalCount := pr.ProjectCards.TotalCount + pr.ProjectItems.TotalCount
+	count := len(pr.ProjectCards.Nodes) + len(pr.ProjectItems.Nodes)
+
+	if count == 0 {
 		return ""
 	}
 
 	projectNames := make([]string, 0, len(pr.ProjectCards.Nodes))
+
+	for _, project := range pr.ProjectItems.Nodes {
+		colName := project.Status.Name
+		if colName == "" {
+			colName = "No Status"
+		}
+		projectNames = append(projectNames, fmt.Sprintf("%s (%s)", project.Project.Title, colName))
+	}
+
 	for _, project := range pr.ProjectCards.Nodes {
+		if project == nil {
+			continue
+		}
 		colName := project.Column.Name
 		if colName == "" {
 			colName = "Awaiting triage"
@@ -399,7 +476,7 @@ func prProjectList(pr api.PullRequest) string {
 	}
 
 	list := strings.Join(projectNames, ", ")
-	if pr.ProjectCards.TotalCount > len(pr.ProjectCards.Nodes) {
+	if totalCount > count {
 		list += ", …"
 	}
 	return list

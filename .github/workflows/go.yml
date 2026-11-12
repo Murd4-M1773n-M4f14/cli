@@ -1,5 +1,13 @@
-name: Tests
-on: [push, pull_request]
+name: Unit and Integration Tests
+on:
+  push:
+    branches:
+      - trunk
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -9,19 +17,51 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Set up Go 1.16
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16
-
       - name: Check out code
-        uses: actions/checkout@v2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-key-prefix: go-race
 
       - name: Download dependencies
         run: go mod download
 
-      - name: Run tests
-        run: go test -race ./...
+      # -count=1 disables Go's test result cache so every test runs. The build
+      # cache above only exists to reuse compiled packages.
+      - name: Run unit and integration tests
+        run: go test -count=1 -race -tags=integration ./...
 
       - name: Build
         run: go build -v ./cmd/gh
+
+      - name: Build with debug overrides
+        if: matrix.os == 'ubuntu-latest'
+        run: go build -v -tags=ghdebug ./cmd/gh
+
+  integration-tests:
+    env:
+      GH_TOKEN: ${{ github.token }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-key-prefix: go
+
+      - name: Build executable
+        run: make
+
+      - name: Run attestation command set integration tests
+        shell: bash
+        run: |
+          ./test/integration/attestation-cmd/run-all-tests.sh "${{ matrix.os }}"

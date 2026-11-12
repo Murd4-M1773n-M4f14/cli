@@ -1,0 +1,199 @@
+package text
+
+import (
+	"fmt"
+	"math"
+	"net/url"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/cli/go-gh/v2/pkg/text"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+)
+
+var whitespaceRE = regexp.MustCompile(`\s+`)
+
+func Indent(s, indent string) string {
+	return text.Indent(s, indent)
+}
+
+// Title returns a copy of the string s with all Unicode letters that begin words mapped to their Unicode title case.
+func Title(s string) string {
+	c := cases.Title(language.English)
+	return c.String(s)
+}
+
+// RemoveExcessiveWhitespace returns a copy of the string s with excessive whitespace removed.
+func RemoveExcessiveWhitespace(s string) string {
+	return whitespaceRE.ReplaceAllString(strings.TrimSpace(s), " ")
+}
+
+func DisplayWidth(s string) int {
+	return text.DisplayWidth(s)
+}
+
+func Truncate(maxWidth int, s string) string {
+	return text.Truncate(maxWidth, s)
+}
+
+func Pluralize(num int, thing string) string {
+	return text.Pluralize(num, thing)
+}
+
+func FuzzyAgo(a, b time.Time) string {
+	return text.RelativeTimeAgo(a, b)
+}
+
+// FuzzyIn returns a human readable description of how far b lies in the future relative to a, such as "in about 7
+// hours". Each unit is rounded to the nearest whole value rather than truncated, so a duration a hair under a round
+// boundary (for example a 6 month lifetime a second after issuance) is not reported one unit short. A value that
+// rounds up to the next unit's threshold is reported in that larger unit instead, so it never reads "60 minutes".
+func FuzzyIn(a, b time.Time) string {
+	d := b.Sub(a)
+	if d < time.Minute {
+		return "in less than a minute"
+	}
+	if minutes := int(math.Round(d.Minutes())); minutes < 60 {
+		return fmt.Sprintf("in about %s", Pluralize(minutes, "minute"))
+	}
+	if hours := int(math.Round(d.Hours())); hours < 24 {
+		return fmt.Sprintf("in about %s", Pluralize(hours, "hour"))
+	}
+	if days := int(math.Round(d.Hours() / 24)); days < 30 {
+		return fmt.Sprintf("in about %s", Pluralize(days, "day"))
+	}
+	if months := int(math.Round(d.Hours() / 24 / 30)); months < 12 {
+		return fmt.Sprintf("in about %s", Pluralize(months, "month"))
+	}
+	years := max(int(math.Round(d.Hours()/24/365)), 1)
+	return fmt.Sprintf("in about %s", Pluralize(years, "year"))
+}
+
+// FuzzyAgoAbbr is an abbreviated version of FuzzyAgo. It returns a human readable string of the
+// time duration between a and b that is estimated to the nearest unit of time.
+func FuzzyAgoAbbr(a, b time.Time) string {
+	ago := a.Sub(b)
+
+	if ago < time.Hour {
+		return fmt.Sprintf("%d%s", int(ago.Minutes()), "m")
+	}
+	if ago < 24*time.Hour {
+		return fmt.Sprintf("%d%s", int(ago.Hours()), "h")
+	}
+	if ago < 30*24*time.Hour {
+		return fmt.Sprintf("%d%s", int(ago.Hours())/24, "d")
+	}
+
+	return b.Format("Jan _2, 2006")
+}
+
+// DisplayURL returns a copy of the string urlStr removing everything except the scheme, hostname, and path.
+// If the scheme is not specified, "https" is assumed.
+// If there is an error parsing urlStr then urlStr is returned without modification.
+func DisplayURL(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return urlStr
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	return scheme + "://" + u.Hostname() + u.Path
+}
+
+// RemoveDiacritics returns the input value without "diacritics", or accent marks
+func RemoveDiacritics(value string) string {
+	return text.RemoveDiacritics(value)
+}
+
+func PadRight(maxWidth int, s string) string {
+	return text.PadRight(maxWidth, s)
+}
+
+// FormatSlice concatenates elements of the given string slice into a
+// well-formatted, possibly multiline, string with specific line length limit.
+// Elements can be optionally surrounded by custom strings (e.g., quotes or
+// brackets). If the lineLength argument is non-positive, no line length limit
+// will be applied.
+func FormatSlice(values []string, lineLength uint, indent uint, prependWith string, appendWith string, sort bool) string {
+	if lineLength <= 0 {
+		lineLength = math.MaxInt
+	}
+
+	sortedValues := values
+	if sort {
+		sortedValues = slices.Clone(values)
+		slices.Sort(sortedValues)
+	}
+
+	pre := strings.Repeat(" ", int(indent))
+	if len(sortedValues) == 0 {
+		return pre
+	} else if len(sortedValues) == 1 {
+		return pre + sortedValues[0]
+	}
+
+	builder := strings.Builder{}
+	currentLineLength := 0
+	sep := ","
+	ws := " "
+
+	for i := 0; i < len(sortedValues); i++ {
+		v := prependWith + sortedValues[i] + appendWith
+		isLast := i == -1+len(sortedValues)
+
+		if currentLineLength == 0 {
+			builder.WriteString(pre)
+			builder.WriteString(v)
+			currentLineLength += len(v)
+			if !isLast {
+				builder.WriteString(sep)
+				currentLineLength += len(sep)
+			}
+		} else {
+			if !isLast && currentLineLength+len(ws)+len(v)+len(sep) > int(lineLength) ||
+				isLast && currentLineLength+len(ws)+len(v) > int(lineLength) {
+				currentLineLength = 0
+				builder.WriteString("\n")
+				i--
+				continue
+			}
+
+			builder.WriteString(ws)
+			builder.WriteString(v)
+			currentLineLength += len(ws) + len(v)
+			if !isLast {
+				builder.WriteString(sep)
+				currentLineLength += len(sep)
+			}
+		}
+	}
+	return builder.String()
+}
+
+// FormatSize formats a byte count using binary units (B, KB, MB, GB, TB, PB).
+// Values below a kilobyte are shown as whole bytes; larger values are shown with
+// one decimal place of precision.
+func FormatSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+
+	// Stop at the largest known unit so an out-of-range index can never occur,
+	// even for byte counts beyond a petabyte.
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit && exp < len(units)-1; v /= unit {
+		div *= unit
+		exp++
+	}
+
+	value := float64(n) / float64(div)
+	return fmt.Sprintf("%.1f %s", value, units[exp])
+}

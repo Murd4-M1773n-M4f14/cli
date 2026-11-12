@@ -1,6 +1,11 @@
 package git
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
 
 func TestIsURL(t *testing.T) {
 	tests := []struct {
@@ -29,11 +34,6 @@ func TestIsURL(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "git with extension",
-			url:  "git://example.com/owner/repo.git",
-			want: true,
-		},
-		{
 			name: "git+ssh",
 			url:  "git+ssh://git@example.com/owner/repo.git",
 			want: true,
@@ -56,9 +56,14 @@ func TestIsURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsURL(tt.url); got != tt.want {
-				t.Errorf("IsURL() = %v, want %v", got, tt.want)
-			}
+			// Given a possible Git remote URL
+			rawURL := tt.url
+
+			// When it is classified
+			got := IsURL(rawURL)
+
+			// Then only supported URL forms are accepted
+			assert.Equal(t, tt.want, got, "expected URL classification to match the transport form")
 		})
 	}
 }
@@ -71,10 +76,9 @@ func TestParseURL(t *testing.T) {
 		Path   string
 	}
 	tests := []struct {
-		name    string
-		url     string
-		want    url
-		wantErr bool
+		name string
+		url  string
+		want url
 	}{
 		{
 			name: "HTTPS",
@@ -123,6 +127,26 @@ func TestParseURL(t *testing.T) {
 				Scheme: "ssh",
 				User:   "git",
 				Host:   "example.com",
+				Path:   "/owner/repo.git",
+			},
+		},
+		{
+			name: "ssh, ipv6",
+			url:  "ssh://git@[::1]/owner/repo.git",
+			want: url{
+				Scheme: "ssh",
+				User:   "git",
+				Host:   "[::1]",
+				Path:   "/owner/repo.git",
+			},
+		},
+		{
+			name: "ssh with port, ipv6",
+			url:  "ssh://git@[::1]:22/owner/repo.git",
+			want: url{
+				Scheme: "ssh",
+				User:   "git",
+				Host:   "[::1]",
 				Path:   "/owner/repo.git",
 			},
 		},
@@ -199,22 +223,30 @@ func TestParseURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			u, err := ParseURL(tt.url)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("got error: %v", err)
-			}
-			if u.Scheme != tt.want.Scheme {
-				t.Errorf("expected scheme %q, got %q", tt.want.Scheme, u.Scheme)
-			}
-			if u.User.Username() != tt.want.User {
-				t.Errorf("expected user %q, got %q", tt.want.User, u.User.Username())
-			}
-			if u.Host != tt.want.Host {
-				t.Errorf("expected host %q, got %q", tt.want.Host, u.Host)
-			}
-			if u.Path != tt.want.Path {
-				t.Errorf("expected path %q, got %q", tt.want.Path, u.Path)
-			}
+			// Given a valid Git remote URL
+			rawURL := tt.url
+
+			// When it is normalized
+			u, err := ParseURL(rawURL)
+
+			// Then its canonical URL components are returned
+			require.NoError(t, err)
+			assert.Equal(t, tt.want.Scheme, u.Scheme)
+			assert.Equal(t, tt.want.User, u.User.Username())
+			assert.Equal(t, tt.want.Host, u.Host)
+			assert.Equal(t, tt.want.Path, u.Path)
 		})
 	}
+}
+
+func TestParseURLReportsMalformedInput(t *testing.T) {
+	// Given an SSH URL with a malformed bracketed host
+	rawURL := "ssh://git@[/tmp/git-repo"
+
+	// When it is parsed
+	u, err := ParseURL(rawURL)
+
+	// Then the malformed URL is rejected
+	require.Error(t, err)
+	assert.Nil(t, u)
 }

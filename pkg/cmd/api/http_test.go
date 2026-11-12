@@ -2,7 +2,7 @@ package api
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
@@ -12,44 +12,44 @@ import (
 func Test_groupGraphQLVariables(t *testing.T) {
 	tests := []struct {
 		name string
-		args map[string]interface{}
-		want map[string]interface{}
+		args map[string]any
+		want map[string]any
 	}{
 		{
 			name: "empty",
-			args: map[string]interface{}{},
-			want: map[string]interface{}{},
+			args: map[string]any{},
+			want: map[string]any{},
 		},
 		{
 			name: "query only",
-			args: map[string]interface{}{
+			args: map[string]any{
 				"query": "QUERY",
 			},
-			want: map[string]interface{}{
+			want: map[string]any{
 				"query": "QUERY",
 			},
 		},
 		{
 			name: "variables only",
-			args: map[string]interface{}{
+			args: map[string]any{
 				"name": "hubot",
 			},
-			want: map[string]interface{}{
-				"variables": map[string]interface{}{
+			want: map[string]any{
+				"variables": map[string]any{
 					"name": "hubot",
 				},
 			},
 		},
 		{
 			name: "query + variables",
-			args: map[string]interface{}{
+			args: map[string]any{
 				"query": "QUERY",
 				"name":  "hubot",
 				"power": 9001,
 			},
-			want: map[string]interface{}{
+			want: map[string]any{
 				"query": "QUERY",
-				"variables": map[string]interface{}{
+				"variables": map[string]any{
 					"name":  "hubot",
 					"power": 9001,
 				},
@@ -57,15 +57,15 @@ func Test_groupGraphQLVariables(t *testing.T) {
 		},
 		{
 			name: "query + operationName + variables",
-			args: map[string]interface{}{
+			args: map[string]any{
 				"query":         "query Q1{} query Q2{}",
 				"operationName": "Q1",
 				"power":         9001,
 			},
-			want: map[string]interface{}{
+			want: map[string]any{
 				"query":         "query Q1{} query Q2{}",
 				"operationName": "Q1",
-				"variables": map[string]interface{}{
+				"variables": map[string]any{
 					"power": 9001,
 				},
 			},
@@ -94,16 +94,20 @@ func Test_httpRequest(t *testing.T) {
 	type args struct {
 		client  *http.Client
 		host    string
+		apiHost string
 		method  string
 		p       string
-		params  interface{}
+		params  any
 		headers []string
 	}
 	type expects struct {
-		method  string
-		u       string
-		body    string
-		headers string
+		method        string
+		u             string
+		path          string // decoded path, checked when non-empty
+		rawURLString  string // encoded URL from req.URL.String(), checked when non-empty
+		body          string
+		headers       string
+		contentLength int64
 	}
 	tests := []struct {
 		name    string
@@ -126,7 +130,43 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
+			},
+		},
+		{
+			name: "GET with accept header",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "GET",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{"Accept: testing"},
+			},
+			wantErr: false,
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				body:    "",
+				headers: "Accept: testing\r\n",
+			},
+		},
+		{
+			name: "lowercase HTTP method",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "get",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{},
+			},
+			wantErr: false,
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				body:    "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -144,7 +184,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -162,7 +202,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://example.org/api/v3/repos/octocat/spoon-knife",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -172,7 +212,7 @@ func Test_httpRequest(t *testing.T) {
 				host:   "github.com",
 				method: "GET",
 				p:      "repos/octocat/spoon-knife",
-				params: map[string]interface{}{
+				params: map[string]any{
 					"a": "b",
 				},
 				headers: []string{},
@@ -182,7 +222,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "GET",
 				u:       "https://api.github.com/repos/octocat/spoon-knife?a=b",
 				body:    "",
-				headers: "",
+				headers: "Accept: */*\r\n",
 			},
 		},
 		{
@@ -192,7 +232,7 @@ func Test_httpRequest(t *testing.T) {
 				host:   "github.com",
 				method: "POST",
 				p:      "repos",
-				params: map[string]interface{}{
+				params: map[string]any{
 					"a": "b",
 				},
 				headers: []string{},
@@ -202,7 +242,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://api.github.com/repos",
 				body:    `{"a":"b"}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -212,8 +252,8 @@ func Test_httpRequest(t *testing.T) {
 				host:   "github.com",
 				method: "POST",
 				p:      "graphql",
-				params: map[string]interface{}{
-					"a": []byte("b"),
+				params: map[string]any{
+					"a": "b",
 				},
 				headers: []string{},
 			},
@@ -222,7 +262,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://api.github.com/graphql",
 				body:    `{"variables":{"a":"b"}}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -232,7 +272,7 @@ func Test_httpRequest(t *testing.T) {
 				host:    "example.org",
 				method:  "POST",
 				p:       "graphql",
-				params:  map[string]interface{}{},
+				params:  map[string]any{},
 				headers: []string{},
 			},
 			wantErr: false,
@@ -240,7 +280,7 @@ func Test_httpRequest(t *testing.T) {
 				method:  "POST",
 				u:       "https://example.org/api/graphql",
 				body:    `{}`,
-				headers: "Content-Type: application/json; charset=utf-8\r\n",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
 			},
 		},
 		{
@@ -264,10 +304,118 @@ func Test_httpRequest(t *testing.T) {
 				headers: "Accept: application/json\r\nContent-Type: text/plain\r\n",
 			},
 		},
+		{
+			name: "relative REST path with api_host: host is swapped",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				apiHost: "api.mygateway.example",
+				method:  "GET",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{},
+			},
+			want: expects{
+				method:  "GET",
+				u:       "https://api.mygateway.example/repos/octocat/spoon-knife",
+				headers: "Accept: */*\r\n",
+			},
+		},
+		{
+			name: "graphql with api_host: host is swapped",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				apiHost: "api.mygateway.example",
+				method:  "POST",
+				p:       "graphql",
+				params:  map[string]any{},
+				headers: []string{},
+			},
+			want: expects{
+				method:  "POST",
+				u:       "https://api.mygateway.example/graphql",
+				body:    "{}",
+				headers: "Accept: */*\r\nContent-Type: application/json; charset=utf-8\r\n",
+			},
+		},
+		{
+			name: "absolute URL with api_host: URL is unchanged",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				apiHost: "api.mygateway.example",
+				method:  "GET",
+				p:       "https://api.github.com/repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{},
+			},
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				headers: "Accept: */*\r\n",
+			},
+		},
+		{
+			name: "relative path without api_host: unchanged",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "GET",
+				p:       "repos/octocat/spoon-knife",
+				params:  nil,
+				headers: []string{},
+			},
+			want: expects{
+				method:  "GET",
+				u:       "https://api.github.com/repos/octocat/spoon-knife",
+				headers: "Accept: */*\r\n",
+			},
+		},
+		{
+			// gh api takes the path verbatim - characters that safeurl would encode
+			// must pass through unchanged. This test uses a space and brackets,
+			// which safeurl would percent-encode.
+			name: "path with characters safeurl would escape: passed verbatim",
+			args: args{
+				client:  &httpClient,
+				host:    "github.com",
+				method:  "GET",
+				p:       "repos/octocat/hello world[0]",
+				params:  nil,
+				headers: []string{},
+			},
+			want: expects{
+				method:       "GET",
+				path:         "/repos/octocat/hello world[0]",
+				rawURLString: "https://api.github.com/repos/octocat/hello%20world%5B0%5D",
+				headers:      "Accept: */*\r\n",
+			},
+		},
+		{
+			name: "Content-Length header sets req.ContentLength",
+			args: args{
+				client: &httpClient,
+				host:   "github.com",
+				method: "POST",
+				p:      "repos",
+				params: bytes.NewBufferString("BODY"),
+				headers: []string{
+					"Content-Length: 4",
+				},
+			},
+			want: expects{
+				method:        "POST",
+				u:             "https://api.github.com/repos",
+				body:          "BODY",
+				headers:       "Accept: */*\r\n",
+				contentLength: 4,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := httpRequest(tt.args.client, tt.args.host, tt.args.method, tt.args.p, tt.args.params, tt.args.headers)
+			got, err := httpRequest(tt.args.client, tt.args.host, tt.args.apiHost, tt.args.method, tt.args.p, tt.args.params, tt.args.headers)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("httpRequest() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -276,12 +424,18 @@ func Test_httpRequest(t *testing.T) {
 			if req.Method != tt.want.method {
 				t.Errorf("Request.Method = %q, want %q", req.Method, tt.want.method)
 			}
-			if req.URL.String() != tt.want.u {
+			if tt.want.u != "" && req.URL.String() != tt.want.u {
 				t.Errorf("Request.URL = %q, want %q", req.URL.String(), tt.want.u)
+			}
+			if tt.want.path != "" && req.URL.Path != tt.want.path {
+				t.Errorf("Request.URL.Path = %q, want %q", req.URL.Path, tt.want.path)
+			}
+			if tt.want.rawURLString != "" && req.URL.String() != tt.want.rawURLString {
+				t.Errorf("Request.URL.String() = %q, want %q", req.URL.String(), tt.want.rawURLString)
 			}
 
 			if tt.want.body != "" {
-				bb, err := ioutil.ReadAll(req.Body)
+				bb, err := io.ReadAll(req.Body)
 				if err != nil {
 					t.Errorf("Request.Body ReadAll error = %v", err)
 					return
@@ -300,6 +454,9 @@ func Test_httpRequest(t *testing.T) {
 			if h.String() != tt.want.headers {
 				t.Errorf("Request.Header = %q, want %q", h.String(), tt.want.headers)
 			}
+			if tt.want.contentLength != 0 && req.ContentLength != tt.want.contentLength {
+				t.Errorf("Request.ContentLength = %d, want %d", req.ContentLength, tt.want.contentLength)
+			}
 		})
 	}
 }
@@ -307,7 +464,7 @@ func Test_httpRequest(t *testing.T) {
 func Test_addQuery(t *testing.T) {
 	type args struct {
 		path   string
-		params map[string]interface{}
+		params map[string]any
 	}
 	tests := []struct {
 		name string
@@ -318,15 +475,23 @@ func Test_addQuery(t *testing.T) {
 			name: "string",
 			args: args{
 				path:   "",
-				params: map[string]interface{}{"a": "hello"},
+				params: map[string]any{"a": "hello"},
 			},
 			want: "?a=hello",
+		},
+		{
+			name: "array",
+			args: args{
+				path:   "",
+				params: map[string]any{"a": []any{"hello", "world"}},
+			},
+			want: "?a%5B%5D=hello&a%5B%5D=world",
 		},
 		{
 			name: "append",
 			args: args{
 				path:   "path",
-				params: map[string]interface{}{"a": "b"},
+				params: map[string]any{"a": "b"},
 			},
 			want: "path?a=b",
 		},
@@ -334,7 +499,7 @@ func Test_addQuery(t *testing.T) {
 			name: "append query",
 			args: args{
 				path:   "path?foo=bar",
-				params: map[string]interface{}{"a": "b"},
+				params: map[string]any{"a": "b"},
 			},
 			want: "path?foo=bar&a=b",
 		},
@@ -342,7 +507,7 @@ func Test_addQuery(t *testing.T) {
 			name: "[]byte",
 			args: args{
 				path:   "",
-				params: map[string]interface{}{"a": []byte("hello")},
+				params: map[string]any{"a": []byte("hello")},
 			},
 			want: "?a=hello",
 		},
@@ -350,7 +515,7 @@ func Test_addQuery(t *testing.T) {
 			name: "int",
 			args: args{
 				path:   "",
-				params: map[string]interface{}{"a": 123},
+				params: map[string]any{"a": 123},
 			},
 			want: "?a=123",
 		},
@@ -358,7 +523,7 @@ func Test_addQuery(t *testing.T) {
 			name: "nil",
 			args: args{
 				path:   "",
-				params: map[string]interface{}{"a": nil},
+				params: map[string]any{"a": nil},
 			},
 			want: "?a=",
 		},
@@ -366,7 +531,7 @@ func Test_addQuery(t *testing.T) {
 			name: "bool",
 			args: args{
 				path:   "",
-				params: map[string]interface{}{"a": true, "b": false},
+				params: map[string]any{"a": true, "b": false},
 			},
 			want: "?a=true&b=false",
 		},

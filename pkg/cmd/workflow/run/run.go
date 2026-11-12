@@ -5,20 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/workflow/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -27,6 +29,8 @@ type RunOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Detector   fd.Detector
+	Prompter   iprompter
 
 	Selector  string
 	Ref       string
@@ -39,27 +43,35 @@ type RunOptions struct {
 	Prompt bool
 }
 
+type iprompter interface {
+	Input(string, string) (string, error)
+	Select(string, string, []string) (int, error)
+}
+
 func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command {
 	opts := &RunOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		Prompter:   f.Prompter,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "run [<workflow-id> | <workflow-name>]",
 		Short: "Run a workflow by creating a workflow_dispatch event",
-		Long: heredoc.Doc(`
-			Create a workflow_dispatch event for a given workflow.
+		Long: heredoc.Docf(`
+			Create a %[1]sworkflow_dispatch%[1]s event for a given workflow.
 
-			This command will trigger GitHub Actions to run a given workflow file.  The given workflow file must
-			support a workflow_dispatch 'on' trigger in order to be run in this way.
+			This command will trigger GitHub Actions to run a given workflow file. The given workflow file must
+			support an %[1]son.workflow_dispatch%[1]s trigger in order to be run in this way.
 
 			If the workflow file supports inputs, they can be specified in a few ways:
 
 			- Interactively
-			- via -f or -F flags
-			- As JSON, via STDIN
-    `),
+			- Via %[1]s-f/--raw-field%[1]s or %[1]s-F/--field%[1]s flags
+			- As JSON, via standard input
+
+			The created workflow run URL will be returned if available.
+		`, "`"),
 		Example: heredoc.Doc(`
 			# Have gh prompt you for what workflow you'd like to run and interactively collect inputs
 			$ gh workflow run
@@ -78,7 +90,7 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 		`),
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(opts.MagicFields)+len(opts.RawFields) > 0 && len(args) == 0 {
-				return cmdutil.FlagError{Err: fmt.Errorf("workflow argument required when passing -f or -F")}
+				return cmdutil.FlagErrorf("workflow argument required when passing -f or -F")
 			}
 			return nil
 		},
@@ -91,28 +103,28 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 			if len(args) > 0 {
 				opts.Selector = args[0]
 			} else if !opts.IO.CanPrompt() {
-				return &cmdutil.FlagError{Err: errors.New("workflow ID, name, or filename required when not running interactively")}
+				return cmdutil.FlagErrorf("workflow ID, name, or filename required when not running interactively")
 			} else {
 				opts.Prompt = true
 			}
 
 			if opts.JSON && !opts.IO.IsStdinTTY() {
-				jsonIn, err := ioutil.ReadAll(opts.IO.In)
+				jsonIn, err := io.ReadAll(opts.IO.In)
 				if err != nil {
 					return errors.New("failed to read from STDIN")
 				}
 				opts.JSONInput = string(jsonIn)
 			} else if opts.JSON {
-				return cmdutil.FlagError{Err: errors.New("--json specified but nothing on STDIN")}
+				return cmdutil.FlagErrorf("--json specified but nothing on STDIN")
 			}
 
 			if opts.Selector == "" {
 				if opts.JSONInput != "" {
-					return &cmdutil.FlagError{Err: errors.New("workflow argument required when passing JSON")}
+					return cmdutil.FlagErrorf("workflow argument required when passing JSON")
 				}
 			} else {
 				if opts.JSON && inputFieldsPassed {
-					return &cmdutil.FlagError{Err: errors.New("only one of STDIN or -f/-F can be passed")}
+					return cmdutil.FlagErrorf("only one of STDIN or -f/-F can be passed")
 				}
 			}
 
@@ -123,10 +135,12 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 			return runRun(opts)
 		},
 	}
-	cmd.Flags().StringVarP(&opts.Ref, "ref", "r", "", "The branch or tag name which contains the version of the workflow file you'd like to run")
-	cmd.Flags().StringArrayVarP(&opts.MagicFields, "field", "F", nil, "Add a string parameter in `key=value` format, respecting @ syntax")
+	cmd.Flags().StringVarP(&opts.Ref, "ref", "r", "", "Branch or tag name which contains the version of the workflow file you'd like to run")
+	cmd.Flags().StringArrayVarP(&opts.MagicFields, "field", "F", nil, "Add a string parameter in `key=value` format, respecting @ syntax (see \"gh help api\").")
 	cmd.Flags().StringArrayVarP(&opts.RawFields, "raw-field", "f", nil, "Add a string parameter in `key=value` format")
 	cmd.Flags().BoolVar(&opts.JSON, "json", false, "Read workflow inputs as JSON via STDIN")
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "ref")
 
 	return cmd
 }
@@ -181,7 +195,7 @@ type InputAnswer struct {
 	providedInputs map[string]string
 }
 
-func (ia *InputAnswer) WriteAnswer(name string, value interface{}) error {
+func (ia *InputAnswer) WriteAnswer(name string, value any) error {
 	if s, ok := value.(string); ok {
 		ia.providedInputs[name] = s
 		return nil
@@ -196,7 +210,7 @@ func (ia *InputAnswer) WriteAnswer(name string, value interface{}) error {
 	return fmt.Errorf("unexpected value type: %v", value)
 }
 
-func collectInputs(yamlContent []byte) (map[string]string, error) {
+func collectInputs(p iprompter, yamlContent []byte) (map[string]string, error) {
 	inputs, err := findInputs(yamlContent)
 	if err != nil {
 		return nil, err
@@ -208,33 +222,36 @@ func collectInputs(yamlContent []byte) (map[string]string, error) {
 		return providedInputs, nil
 	}
 
-	qs := []*survey.Question{}
-	for inputName, input := range inputs {
-		q := &survey.Question{
-			Name: inputName,
-			Prompt: &survey.Input{
-				Message: inputName,
-				Default: input.Default,
-			},
+	for _, input := range inputs {
+		var answer string
+
+		if input.Type == "choice" {
+			name := input.Name
+			if input.Required {
+				name += " (required)"
+			}
+			selected, err := p.Select(name, input.Default, input.Options)
+			if err != nil {
+				return nil, err
+			}
+			answer = input.Options[selected]
+		} else if input.Required {
+			for answer == "" {
+				answer, err = p.Input(input.Name+" (required)", input.Default)
+				if err != nil {
+					break
+				}
+			}
+		} else {
+			answer, err = p.Input(input.Name, input.Default)
 		}
-		if input.Required {
-			q.Validate = survey.Required
+
+		if err != nil {
+			return nil, err
 		}
-		qs = append(qs, q)
-	}
 
-	sort.Slice(qs, func(i, j int) bool {
-		return qs[i].Name < qs[j].Name
-	})
-
-	inputAnswer := InputAnswer{
-		providedInputs: providedInputs,
+		providedInputs[input.Name] = answer
 	}
-	err = prompt.SurveyAsk(qs, &inputAnswer)
-	if err != nil {
-		return nil, err
-	}
-
 	return providedInputs, nil
 }
 
@@ -247,7 +264,12 @@ func runRun(opts *RunOptions) error {
 
 	repo, err := opts.BaseRepo()
 	if err != nil {
-		return fmt.Errorf("could not determine base repo: %w", err)
+		return err
+	}
+
+	if opts.Detector == nil {
+		cachedClient := api.NewCachedHTTPClient(c, time.Hour*24)
+		opts.Detector = fd.NewDetector(cachedClient, repo.RepoHost())
 	}
 
 	ref := opts.Ref
@@ -260,11 +282,10 @@ func runRun(opts *RunOptions) error {
 	}
 
 	states := []shared.WorkflowState{shared.Active}
-	workflow, err := shared.ResolveWorkflow(
+	workflow, err := shared.ResolveWorkflow(opts.Prompter,
 		opts.IO, client, repo, opts.Prompt, opts.Selector, states)
 	if err != nil {
-		var fae shared.FilteredAllError
-		if errors.As(err, &fae) {
+		if _, ok := errors.AsType[shared.FilteredAllError](err); ok {
 			return errors.New("no workflows are enabled on this repository")
 		}
 		return err
@@ -287,52 +308,101 @@ func runRun(opts *RunOptions) error {
 		if err != nil {
 			return fmt.Errorf("unable to fetch workflow file content: %w", err)
 		}
-		providedInputs, err = collectInputs(yamlContent)
+		providedInputs, err = collectInputs(opts.Prompter, yamlContent)
 		if err != nil {
 			return err
 		}
 	}
 
-	path := fmt.Sprintf("repos/%s/actions/workflows/%d/dispatches",
-		ghrepo.FullName(repo), workflow.ID)
+	features, err := opts.Detector.ActionsFeatures()
+	if err != nil {
+		return err
+	}
 
-	requestByte, err := json.Marshal(map[string]interface{}{
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "workflows", strconv.FormatInt(workflow.ID, 10), "dispatches")
+	if err != nil {
+		return err
+	}
+
+	requestBody := map[string]any{
 		"ref":    ref,
 		"inputs": providedInputs,
-	})
+	}
+
+	// TODO workflowDispatchRunDetailsCleanup
+	// We will have to always set the `return_run_details` field to true, unless
+	// we opt into the new REST API version, which will probably return the
+	// details by default.
+	if features.DispatchRunDetails {
+		requestBody["return_run_details"] = true
+	}
+
+	requestByte, err := json.Marshal(requestBody)
 	if err != nil {
 		return fmt.Errorf("failed to serialize workflow inputs: %w", err)
 	}
 
 	body := bytes.NewReader(requestByte)
 
-	err = client.REST(repo.RepoHost(), "POST", path, body, nil)
+	var response struct {
+		WorkflowRunID int64  `json:"workflow_run_id"`
+		RunURL        string `json:"run_url"`
+		HtmlURL       string `json:"html_url"`
+	}
+
+	// Note that the workflow dispatch endpoint used to return 204 No Content
+	// (with no body, obviously). Now it's possible for the endpoint to also
+	// return 200 OK with created run details. So, we have to handle both cases
+	// because old GHE versions still return 204. Even on github.com, we
+	// may still get 204 for any reason.
+	//
+	// Our REST client library is smart enough to ignore JSON unmarshal when it
+	// receives 204, so we're safe here anyway.
+	//
+	// As a related note, the new REST API version (which will come with breaking
+	// changes) will probably default to return 200 + run details.
+	err = client.REST(repo.RepoHost(), "POST", path.String(), body, &response)
 	if err != nil {
 		return fmt.Errorf("could not create workflow dispatch event: %w", err)
 	}
 
 	if opts.IO.IsStdoutTTY() {
-		out := opts.IO.Out
 		cs := opts.IO.ColorScheme()
-		fmt.Fprintf(out, "%s Created workflow_dispatch event for %s at %s\n",
+		fmt.Fprintf(opts.IO.Out, "%s Created workflow_dispatch event for %s at %s\n",
 			cs.SuccessIcon(), cs.Cyan(workflow.Base()), cs.Bold(ref))
 
-		fmt.Fprintln(out)
+		if response.HtmlURL != "" {
+			fmt.Fprintln(opts.IO.Out, response.HtmlURL)
+		}
 
-		fmt.Fprintf(out, "To see runs for this workflow, try: %s\n",
-			cs.Boldf("gh run list --workflow=%s", workflow.Base()))
+		fmt.Fprintln(opts.IO.Out)
+
+		if response.WorkflowRunID != 0 {
+			fmt.Fprintf(opts.IO.Out, "To see the created workflow run, try: %s\n",
+				cs.Boldf("gh run view %d", response.WorkflowRunID))
+		}
+
+		fmt.Fprintf(opts.IO.Out, "To see runs for this workflow, try: %s\n",
+			cs.Boldf("gh run list --workflow=%q", workflow.Base()))
+	} else {
+		if response.HtmlURL != "" {
+			fmt.Fprintln(opts.IO.Out, response.HtmlURL)
+		}
 	}
 
 	return nil
 }
 
 type WorkflowInput struct {
+	Name        string
 	Required    bool
 	Default     string
 	Description string
+	Type        string
+	Options     []string
 }
 
-func findInputs(yamlContent []byte) (map[string]WorkflowInput, error) {
+func findInputs(yamlContent []byte) ([]WorkflowInput, error) {
 	var rootNode yaml.Node
 	err := yaml.Unmarshal(yamlContent, &rootNode)
 	if err != nil {
@@ -397,16 +467,36 @@ func findInputs(yamlContent []byte) (map[string]WorkflowInput, error) {
 		return nil, errors.New("unable to manually run a workflow without a workflow_dispatch event")
 	}
 
-	out := map[string]WorkflowInput{}
+	out := []WorkflowInput{}
+
+	m := map[string]WorkflowInput{}
 
 	if inputsKeyNode == nil || inputsMapNode == nil {
 		return out, nil
 	}
 
-	err = inputsMapNode.Decode(&out)
+	err = inputsMapNode.Decode(&m)
 	if err != nil {
 		return nil, fmt.Errorf("could not decode workflow inputs: %w", err)
 	}
+
+	for name, input := range m {
+		if input.Type == "choice" && len(input.Options) == 0 {
+			return nil, fmt.Errorf("workflow input %q is of type choice, but has no options", name)
+		}
+		out = append(out, WorkflowInput{
+			Name:        name,
+			Default:     input.Default,
+			Description: input.Description,
+			Required:    input.Required,
+			Options:     input.Options,
+			Type:        input.Type,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
 
 	return out, nil
 }

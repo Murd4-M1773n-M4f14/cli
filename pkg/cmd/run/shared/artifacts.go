@@ -1,13 +1,12 @@
 package shared
 
 import (
-	"encoding/json"
-	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 )
 
 type Artifact struct {
@@ -17,37 +16,45 @@ type Artifact struct {
 	Expired     bool   `json:"expired"`
 }
 
+type artifactsPayload struct {
+	Artifacts []Artifact
+}
+
 func ListArtifacts(httpClient *http.Client, repo ghrepo.Interface, runID string) ([]Artifact, error) {
+	var results []Artifact
+
 	perPage := 100
-	path := fmt.Sprintf("repos/%s/%s/actions/artifacts?per_page=%d", repo.RepoOwner(), repo.RepoName(), perPage)
+	u, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "artifacts")
+	if err != nil {
+		return nil, err
+	}
 	if runID != "" {
-		path = fmt.Sprintf("repos/%s/%s/actions/runs/%s/artifacts?per_page=%d", repo.RepoOwner(), repo.RepoName(), runID, perPage)
+		u, err = safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", runID, "artifacts")
+		if err != nil {
+			return nil, err
+		}
+	}
+	u.SetQuery("per_page", strconv.Itoa(perPage))
+	var pageURL safeurl.SafeURL = u
+
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	client := api.NewClientFromHTTP(httpClient)
+
+	for {
+		var payload artifactsPayload
+		nextURL, err := client.RESTWithNext(repo.RepoHost(), http.MethodGet, pageURL.String(), nil, &payload)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, payload.Artifacts...)
+
+		if nextURL == "" {
+			break
+		}
+		pageURL = safeurl.NewImmutableSafeURL(nextURL)
 	}
 
-	req, err := http.NewRequest("GET", ghinstance.RESTPrefix(repo.RepoHost())+path, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode > 299 {
-		return nil, api.HandleHTTPError(resp)
-	}
-
-	var response struct {
-		TotalCount uint16 `json:"total_count"`
-		Artifacts  []Artifact
-	}
-
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&response); err != nil {
-		return response.Artifacts, fmt.Errorf("error parsing JSON: %w", err)
-	}
-
-	return response.Artifacts, nil
+	return results, nil
 }

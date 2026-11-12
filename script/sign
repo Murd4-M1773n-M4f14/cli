@@ -1,0 +1,44 @@
+#!/bin/bash
+# usage: script/sign <file>
+#
+# Signs macOS binaries using codesign, notarizes macOS zip archives using notarytool
+#
+set -e
+
+sign_macos() {
+  if [[ -z "$DO_SIGN_ARTIFACTS" || "$DO_SIGN_ARTIFACTS" == "false" ]]; then
+    echo "skipping macOS code-signing; DO_SIGN_ARTIFACTS not set or false" >&2
+    return 0
+  fi
+
+  if [[ -z "$DEVELOPER_ID_CERT_IDENTIFIER" ]]; then
+    echo "skipping macOS code-signing; DEVELOPER_ID_CERT_IDENTIFIER not set" >&2
+    return 0
+  fi
+
+  if [[ -z "$KEYCHAIN" ]]; then
+    echo "skipping macOS code-signing; KEYCHAIN not set" >&2
+    return 0
+  fi
+
+  if [[ $1 == *.zip ]]; then
+    xcrun notarytool submit "$1" --keychain "$KEYCHAIN" --keychain-profile "notarytool-password" --wait
+  else
+    codesign --timestamp --options=runtime -s "${DEVELOPER_ID_CERT_IDENTIFIER?}" -v "$1"
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: script/sign <file>" >&2
+  exit 1
+fi
+
+platform="$(uname -s)"
+if [[ $platform != "Darwin" ]]; then
+  echo "error: must run on macOS; skipping codesigning/notarization" >&2
+  exit 1
+fi
+
+for input_file; do
+  sign_macos "$input_file"
+done

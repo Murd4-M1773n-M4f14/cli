@@ -5,64 +5,112 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"strings"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/safeurl"
+	"github.com/cli/cli/v2/pkg/cmd/ssh-key/shared"
 )
 
-var scopesError = errors.New("insufficient OAuth scopes")
-
-func SSHKeyUpload(httpClient *http.Client, hostname string, keyFile io.Reader, title string) error {
-	url := ghinstance.RESTPrefix(hostname) + "user/keys"
-
-	keyBytes, err := ioutil.ReadAll(keyFile)
+// Uploads the provided SSH key. Returns true if the key was uploaded, false if it was not.
+func SSHKeyUpload(httpClient *http.Client, hostname string, keyFile io.Reader, title string) (bool, error) {
+	u, err := safeurl.JoinPath("user", "keys")
 	if err != nil {
-		return err
+		return false, err
+	}
+
+	keyBytes, err := io.ReadAll(keyFile)
+	if err != nil {
+		return false, err
+	}
+
+	fullUserKey := string(keyBytes)
+	splitKey := strings.Fields(fullUserKey)
+	if len(splitKey) < 2 {
+		return false, errors.New("provided key is not in a valid format")
+	}
+
+	keyToCompare := splitKey[0] + " " + splitKey[1]
+
+	keys, err := shared.UserKeys(httpClient, hostname, "")
+	if err != nil {
+		return false, err
+	}
+
+	for _, k := range keys {
+		if k.Key == keyToCompare {
+			return false, nil
+		}
 	}
 
 	payload := map[string]string{
 		"title": title,
-		"key":   string(keyBytes),
+		"key":   fullUserKey,
 	}
 
+	err = keyUpload(httpClient, hostname, u, payload)
+
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// Uploads the provided SSH Signing key. Returns true if the key was uploaded, false if it was not.
+func SSHSigningKeyUpload(httpClient *http.Client, hostname string, keyFile io.Reader, title string) (bool, error) {
+	u, err := safeurl.JoinPath("user", "ssh_signing_keys")
+	if err != nil {
+		return false, err
+	}
+
+	keyBytes, err := io.ReadAll(keyFile)
+	if err != nil {
+		return false, err
+	}
+
+	fullUserKey := string(keyBytes)
+	splitKey := strings.Fields(fullUserKey)
+	if len(splitKey) < 2 {
+		return false, errors.New("provided key is not in a valid format")
+	}
+
+	keyToCompare := splitKey[0] + " " + splitKey[1]
+
+	keys, err := shared.UserSigningKeys(httpClient, hostname, "")
+	if err != nil {
+		return false, err
+	}
+
+	for _, k := range keys {
+		if k.Key == keyToCompare {
+			return false, nil
+		}
+	}
+
+	payload := map[string]string{
+		"title": title,
+		"key":   fullUserKey,
+	}
+
+	err = keyUpload(httpClient, hostname, u, payload)
+
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func keyUpload(httpClient *http.Client, hostname string, u safeurl.SafeURL, payload map[string]string) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return err
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
-		return scopesError
-	} else if resp.StatusCode > 299 {
-		var httpError api.HTTPError
-		err := api.HandleHTTPError(resp)
-		if errors.As(err, &httpError) && isDuplicateError(&httpError) {
-			return nil
-		}
-		return err
-	}
-
-	_, err = io.Copy(ioutil.Discard, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func isDuplicateError(err *api.HTTPError) bool {
-	return err.StatusCode == 422 && len(err.Errors) == 1 &&
-		err.Errors[0].Field == "key" && err.Errors[0].Message == "key is already in use"
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	return api.NewClientFromHTTP(httpClient).REST(hostname, http.MethodPost, u.String(), bytes.NewBuffer(payloadBytes), nil)
 }

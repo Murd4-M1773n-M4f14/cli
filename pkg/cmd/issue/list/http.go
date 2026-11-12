@@ -1,15 +1,16 @@
 package list
 
 import (
-	"encoding/base64"
 	"fmt"
-	"strconv"
-	"strings"
+	"regexp"
 
 	"github.com/cli/cli/v2/api"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
 )
+
+var pullRequestSearchQualifierRE = regexp.MustCompile(`(?i)\b(?:is|type):(?:pr|pull-?request)\b`)
 
 func listIssues(client *api.Client, repo ghrepo.Interface, filters prShared.FilterOptions, limit int) (*api.IssuesAndTotalCount, error) {
 	var states []string
@@ -24,12 +25,12 @@ func listIssues(client *api.Client, repo ghrepo.Interface, filters prShared.Filt
 		return nil, fmt.Errorf("invalid state: %s", filters.State)
 	}
 
-	fragments := fmt.Sprintf("fragment issue on Issue {%s}", api.PullRequestGraphQL(filters.Fields))
+	fragments := fmt.Sprintf("fragment issue on Issue {%s}", api.IssueGraphQL(filters.Fields))
 	query := fragments + `
-	query IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $assignee: String, $author: String, $mention: String, $milestone: String) {
+	query IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $assignee: String, $author: String, $mention: String) {
 		repository(owner: $owner, name: $repo) {
 			hasIssuesEnabled
-			issues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention, milestone: $milestone}) {
+			issues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention}) {
 				totalCount
 				nodes {
 					...issue
@@ -43,7 +44,7 @@ func listIssues(client *api.Client, repo ghrepo.Interface, filters prShared.Filt
 	}
 	`
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":  repo.RepoOwner(),
 		"repo":   repo.RepoName(),
 		"states": states,
@@ -59,24 +60,10 @@ func listIssues(client *api.Client, repo ghrepo.Interface, filters prShared.Filt
 	}
 
 	if filters.Milestone != "" {
-		var milestone *api.RepoMilestone
-		if milestoneNumber, err := strconv.ParseInt(filters.Milestone, 10, 32); err == nil {
-			milestone, err = api.MilestoneByNumber(client, repo, int32(milestoneNumber))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			milestone, err = api.MilestoneByTitle(client, repo, "all", filters.Milestone)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		milestoneRESTID, err := milestoneNodeIdToDatabaseId(milestone.ID)
-		if err != nil {
-			return nil, err
-		}
-		variables["milestone"] = milestoneRESTID
+		// The "milestone" filter in the GraphQL connection doesn't work as documented and accepts neither a
+		// milestone number nor a title. It does accept a numeric database ID, but we cannot obtain one
+		// using the GraphQL API.
+		return nil, fmt.Errorf("cannot filter by milestone using the `Repository.issues` GraphQL connection")
 	}
 
 	type responseData struct {
@@ -129,8 +116,21 @@ loop:
 	return &res, nil
 }
 
-func searchIssues(client *api.Client, repo ghrepo.Interface, filters prShared.FilterOptions, limit int) (*api.IssuesAndTotalCount, error) {
-	fragments := fmt.Sprintf("fragment issue on Issue {%s}", api.PullRequestGraphQL(filters.Fields))
+func searchIssues(client *api.Client, detector fd.Detector, repo ghrepo.Interface, filters prShared.FilterOptions, limit int) (*api.IssuesAndTotalCount, error) {
+	if pullRequestSearchQualifierRE.MatchString(filters.Search) {
+		return nil, fmt.Errorf("cannot use pull request search qualifiers with `gh issue list`; use `gh pr list` instead")
+	}
+
+	// TODO advancedIssueSearchCleanup
+	// We won't need feature detection when GHES 3.17 support ends, since
+	// the advanced issue search is the only available search backend for
+	// issues.
+	features, err := detector.SearchFeatures()
+	if err != nil {
+		return nil, err
+	}
+
+	fragments := fmt.Sprintf("fragment issue on Issue {%s}", api.IssueGraphQL(filters.Fields))
 	query := fragments +
 		`query IssueSearch($repo: String!, $owner: String!, $type: SearchType!, $limit: Int, $after: String, $query: String!) {
 			repository(name: $repo, owner: $owner) {
@@ -161,14 +161,28 @@ func searchIssues(client *api.Client, repo ghrepo.Interface, filters prShared.Fi
 	}
 
 	perPage := min(limit, 100)
-	searchQuery := fmt.Sprintf("repo:%s/%s %s", repo.RepoOwner(), repo.RepoName(), prShared.SearchQueryBuild(filters))
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": repo.RepoOwner(),
 		"repo":  repo.RepoName(),
-		"type":  "ISSUE",
 		"limit": perPage,
-		"query": searchQuery,
+	}
+
+	filters.Repo = ghrepo.FullName(repo)
+	filters.Entity = "issue"
+
+	// TODO advancedIssueSearchCleanup
+	if features.AdvancedIssueSearchAPI {
+		variables["query"] = prShared.SearchQueryBuild(filters, true)
+		// TODO advancedIssueSearchCleanup
+		if features.AdvancedIssueSearchAPIOptIn {
+			variables["type"] = "ISSUE_ADVANCED"
+		} else {
+			variables["type"] = "ISSUE"
+		}
+	} else {
+		variables["query"] = prShared.SearchQueryBuild(filters, false)
+		variables["type"] = "ISSUE"
 	}
 
 	ic := api.IssuesAndTotalCount{SearchCapped: limit > 1000}
@@ -202,28 +216,4 @@ loop:
 	}
 
 	return &ic, nil
-}
-
-// milestoneNodeIdToDatabaseId extracts the REST Database ID from the GraphQL Node ID
-// This conversion is necessary since the GraphQL API requires the use of the milestone's database ID
-// for querying the related issues.
-func milestoneNodeIdToDatabaseId(nodeId string) (string, error) {
-	// The Node ID is Base64 obfuscated, with an underlying pattern:
-	// "09:Milestone12345", where "12345" is the database ID
-	decoded, err := base64.StdEncoding.DecodeString(nodeId)
-	if err != nil {
-		return "", err
-	}
-	splitted := strings.Split(string(decoded), "Milestone")
-	if len(splitted) != 2 {
-		return "", fmt.Errorf("couldn't get database id from node id")
-	}
-	return splitted[1], nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

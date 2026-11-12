@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cli/cli/v2/internal/debug"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
@@ -13,8 +14,9 @@ func NewCmdVersion(f *cmdutil.Factory, version, buildDate string) *cobra.Command
 	cmd := &cobra.Command{
 		Use:    "version",
 		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Fprint(f.IOStreams.Out, Format(version, buildDate))
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Fprint(f.IOStreams.Out, cmd.Root().Annotations["versionInfo"])
+			return nil
 		},
 	}
 
@@ -24,6 +26,10 @@ func NewCmdVersion(f *cmdutil.Factory, version, buildDate string) *cobra.Command
 }
 
 func Format(version, buildDate string) string {
+	return format(version, buildDate, debug.Enabled)
+}
+
+func format(version, buildDate string, debugBuild bool) string {
 	version = strings.TrimPrefix(version, "v")
 
 	var dateStr string
@@ -31,7 +37,12 @@ func Format(version, buildDate string) string {
 		dateStr = fmt.Sprintf(" (%s)", buildDate)
 	}
 
-	return fmt.Sprintf("gh version %s%s\n%s\n", version, dateStr, changelogURL(version))
+	var debugStr string
+	if debugBuild {
+		debugStr = " [debug build]"
+	}
+
+	return fmt.Sprintf("gh version %s%s%s\n%s\n", version, dateStr, debugStr, changelogURL(version))
 }
 
 func changelogURL(version string) string {
